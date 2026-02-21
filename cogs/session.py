@@ -14,11 +14,10 @@ from utils import ROLE_EMOJIS, build_embed, fmt_player, is_admin, is_session_own
 class SessionControlView(discord.ui.View):
     """
     Persistent control panel posted when a session starts.
-    Lets the session owner/admin quickly add players, view roster, etc.
     """
 
     def __init__(self, session_id: int, guild_id: str, cog):
-        super().__init__(timeout=None)  # Persist until session ends
+        super().__init__(timeout=None)
         self.session_id = session_id
         self.guild_id = guild_id
         self.cog = cog
@@ -36,7 +35,6 @@ class SessionControlView(discord.ui.View):
     async def add_from_voice_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._auth(interaction):
             return
-        # Show a select of voice channels
         vcs = [vc for vc in interaction.guild.voice_channels if vc.members]
         if not vcs:
             await interaction.response.send_message("No occupied voice channels found.", ephemeral=True)
@@ -63,42 +61,40 @@ class SessionControlView(discord.ui.View):
                 await inter.response.send_message("No active session.", ephemeral=True)
                 return
             added, auto_reg = [], []
+            guild_id = str(inter.guild_id)
             for member in vc.members:
                 if member.bot:
                     continue
-                p = await self.cog.db.get_player(str(member.id), str(inter.guild_id))
+                p = await self.cog.db.get_player(str(member.id), guild_id)
                 if not p:
-                    await self.cog.db.upsert_player(str(member.id), str(inter.guild_id), member.display_name, [])
+                    await self.cog.db.upsert_player(str(member.id), guild_id, member.display_name, [])
                     auto_reg.append(member.display_name)
-                await self.cog.db.add_session_player(session["id"], str(member.id), str(inter.guild_id))
+                await self.cog.db.add_session_player(session["id"], str(member.id), guild_id)
                 added.append(member.display_name)
-            players = await self.cog.db.get_session_players(session["id"], str(inter.guild_id))
+            players = await self.cog.db.get_session_players(session["id"], guild_id)
             desc = f"Added **{len(added)}** from **{vc.name}**."
             if auto_reg:
                 desc += f"\nAuto-registered: {', '.join(auto_reg)}"
-            desc += f"\n\n**Roster ({len(players)}):**\n" + "\n".join(f"• {fmt_player(p, show_stats=False)}" for p in players)
-            await inter.response.edit_message(content=None, embed=build_embed("Players Added", desc, "blue"), view=None)
+            desc += f"\n\n**Roster ({len(players)}):**\n" + "\n".join(
+                f"• {fmt_player(p, show_stats=False)}" for p in players
+            )
+            await inter.response.edit_message(
+                content=None, embed=build_embed("Players Added", desc, "blue"), view=None
+            )
 
         select.callback = on_vc_select
         v = discord.ui.View(timeout=60)
         v.add_item(select)
         await interaction.response.send_message("Select a voice channel:", view=v, ephemeral=True)
 
-    @discord.ui.button(label="Add Player", style=discord.ButtonStyle.secondary, emoji="➕", row=0)
-    async def add_player_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._auth(interaction):
-            return
-        await interaction.response.send_message(
-            "Use `/add_player` to add specific players by mention.", ephemeral=True
-        )
-
     @discord.ui.button(label="View Roster", style=discord.ButtonStyle.secondary, emoji="📋", row=0)
     async def view_roster_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        session = await self.cog.db.get_active_session(str(interaction.guild_id))
+        guild_id = str(interaction.guild_id)
+        session = await self.cog.db.get_active_session(guild_id)
         if not session:
             await interaction.response.send_message("No active session.", ephemeral=True)
             return
-        players = await self.cog.db.get_session_players(session["id"], str(interaction.guild_id))
+        players = await self.cog.db.get_session_players(session["id"], guild_id)
         if not players:
             await interaction.response.send_message("No players in session yet.", ephemeral=True)
             return
@@ -157,23 +153,23 @@ class Session(commands.Cog):
     def db(self):
         return self.bot.db
 
-    async def _require_session(self, interaction: discord.Interaction) -> dict | None:
-        session = await self.db.get_active_session(str(interaction.guild_id))
-        if not session:
-            await interaction.response.send_message(
-                "No active session. Use `/start_session` first.", ephemeral=True
-            )
-        return session
+    async def _get_session_or_error(self, interaction: discord.Interaction) -> dict | None:
+        """
+        Fetches the active session. Does NOT send any response.
+        Returns None if no session. Caller must handle the None case and send its own response.
+        """
+        return await self.db.get_active_session(str(interaction.guild_id))
 
     # ── /start_session ────────────────────────────────────────────────────────
-    # Open to anyone; the creator becomes session owner
 
     @app_commands.command(name="start_session", description="Start a new custom game session.")
     @app_commands.describe(
         track_roles="Avoid giving the same role twice in one session (default: ON)"
     )
     async def start_session(self, interaction: discord.Interaction, track_roles: bool = True):
-        existing = await self.db.get_active_session(str(interaction.guild_id))
+        guild_id = str(interaction.guild_id)
+        existing = await self.db.get_active_session(guild_id)
+
         if existing:
             class ConfirmView(discord.ui.View):
                 def __init__(self_v):
@@ -182,11 +178,10 @@ class Session(commands.Cog):
                 @discord.ui.button(label="End old & start new", style=discord.ButtonStyle.danger)
                 async def confirm(self_v, btn_inter: discord.Interaction, button: discord.ui.Button):
                     self_v.stop()
+                    gid = str(btn_inter.guild_id)
                     await self.db.end_session(existing["id"])
-                    sid = await self.db.create_session(
-                        str(btn_inter.guild_id), str(btn_inter.user.id), track_roles
-                    )
-                    view = SessionControlView(sid, str(btn_inter.guild_id), self)
+                    sid = await self.db.create_session(gid, str(btn_inter.user.id), track_roles)
+                    view = SessionControlView(sid, gid, self)
                     embed = self._session_started_embed(sid, btn_inter.user, track_roles)
                     await btn_inter.response.edit_message(content=None, embed=embed, view=view)
 
@@ -197,40 +192,38 @@ class Session(commands.Cog):
 
             await interaction.response.send_message(
                 "There's already an active session. End it and start a new one?",
-                view=ConfirmView(), ephemeral=False
+                view=ConfirmView(), ephemeral=True
             )
             return
 
-        sid = await self.db.create_session(
-            str(interaction.guild_id), str(interaction.user.id), track_roles
-        )
-        view = SessionControlView(sid, str(interaction.guild_id), self)
+        sid = await self.db.create_session(guild_id, str(interaction.user.id), track_roles)
+        view = SessionControlView(sid, guild_id, self)
         embed = self._session_started_embed(sid, interaction.user, track_roles)
         await interaction.response.send_message(embed=embed, view=view)
 
     def _session_started_embed(self, sid: int, user: discord.User, track_roles: bool) -> discord.Embed:
         track_note = (
-            "✅ **Role tracking ON** — players won't get the same role twice this session. "
-            "Turn off by starting a new session with `track_roles: False`."
+            "✅ **Role tracking ON** — players won't get the same role twice this session.\n"
+            "Start a new session with `track_roles: False` to disable."
             if track_roles else
             "❌ **Role tracking OFF** — roles will be assigned freely."
         )
-        embed = build_embed(
+        return build_embed(
             "Session Started!",
-            f"Session **#{sid}** started by {user.mention}\n\n"
+            f"Session **#{sid}** — started by {user.mention}\n\n"
             f"{track_note}\n\n"
-            "Use the buttons below to manage the session, or slash commands directly.",
+            "Use the buttons below or slash commands to manage the session.",
             "green"
         )
-        return embed
 
     # ── /end_session ──────────────────────────────────────────────────────────
 
     @app_commands.command(name="end_session", description="End the current session.")
     @is_session_owner()
     async def end_session(self, interaction: discord.Interaction):
-        session = await self._require_session(interaction)
+        session = await self._get_session_or_error(interaction)
         if not session:
+            await interaction.response.send_message("No active session.", ephemeral=True)
             return
 
         class ConfirmView(discord.ui.View):
@@ -264,8 +257,10 @@ class Session(commands.Cog):
     @app_commands.describe(channel="The voice channel to pull players from")
     @is_session_owner()
     async def add_from_voice(self, interaction: discord.Interaction, channel: discord.VoiceChannel):
-        session = await self._require_session(interaction)
+        guild_id = str(interaction.guild_id)
+        session = await self._get_session_or_error(interaction)
         if not session:
+            await interaction.response.send_message("No active session.", ephemeral=True)
             return
 
         if not channel.members:
@@ -276,22 +271,21 @@ class Session(commands.Cog):
         for member in channel.members:
             if member.bot:
                 continue
-            player = await self.db.get_player(str(member.id), str(interaction.guild_id))
+            player = await self.db.get_player(str(member.id), guild_id)
             if not player:
-                await self.db.upsert_player(str(member.id), str(interaction.guild_id), member.display_name, [])
+                await self.db.upsert_player(str(member.id), guild_id, member.display_name, [])
                 auto_registered.append(member.display_name)
-            await self.db.add_session_player(session["id"], str(member.id), str(interaction.guild_id))
+            await self.db.add_session_player(session["id"], str(member.id), guild_id)
             added.append(member.display_name)
 
-        players = await self.db.get_session_players(session["id"], str(interaction.guild_id))
+        players = await self.db.get_session_players(session["id"], guild_id)
         desc = f"Added **{len(added)}** player(s) from **{channel.name}**."
         if auto_registered:
             desc += f"\nAuto-registered: {', '.join(auto_registered)}"
         desc += f"\n\n**Session roster ({len(players)} players):**\n"
         desc += "\n".join(f"• {fmt_player(p, show_stats=False)}" for p in players)
 
-        embed = build_embed("Players Added", desc, "blue")
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=build_embed("Players Added", desc, "blue"))
 
     # ── /add_player ───────────────────────────────────────────────────────────
 
@@ -310,25 +304,35 @@ class Session(commands.Cog):
                           member3: discord.Member = None,
                           member4: discord.Member = None,
                           member5: discord.Member = None):
-        session = await self._require_session(interaction)
+        guild_id = str(interaction.guild_id)
+
+        # Get session directly — do NOT use _require_session (it sends its own response)
+        session = await self.db.get_active_session(guild_id)
         if not session:
+            await interaction.response.send_message("No active session.", ephemeral=True)
             return
 
         members = [m for m in [member1, member2, member3, member4, member5] if m is not None]
         added, auto_reg = [], []
+
         for member in members:
             if member.bot:
                 continue
-            player = await self.db.get_player(str(member.id), str(interaction.guild_id))
+            player = await self.db.get_player(str(member.id), guild_id)
             if not player:
-                await self.db.upsert_player(str(member.id), str(interaction.guild_id), member.display_name, [])
+                await self.db.upsert_player(str(member.id), guild_id, member.display_name, [])
                 auto_reg.append(member.display_name)
-            await self.db.add_session_player(session["id"], str(member.id), str(interaction.guild_id))
+            await self.db.add_session_player(session["id"], str(member.id), guild_id)
             added.append(member.display_name)
+
+        if not added:
+            await interaction.response.send_message("No valid players to add.", ephemeral=True)
+            return
 
         desc = f"Added: {', '.join(f'**{n}**' for n in added)}"
         if auto_reg:
-            desc += f"\nAuto-registered: {', '.join(auto_reg)}"
+            desc += f"\nAuto-registered (no role prefs): {', '.join(auto_reg)}"
+
         await interaction.response.send_message(f"✅ {desc}", ephemeral=True)
 
     # ── /remove_player ────────────────────────────────────────────────────────
@@ -337,10 +341,12 @@ class Session(commands.Cog):
     @app_commands.describe(member="The member to remove")
     @is_session_owner()
     async def remove_player(self, interaction: discord.Interaction, member: discord.Member):
-        session = await self._require_session(interaction)
+        guild_id = str(interaction.guild_id)
+        session = await self.db.get_active_session(guild_id)
         if not session:
+            await interaction.response.send_message("No active session.", ephemeral=True)
             return
-        await self.db.remove_session_player(session["id"], str(member.id), str(interaction.guild_id))
+        await self.db.remove_session_player(session["id"], str(member.id), guild_id)
         await interaction.response.send_message(
             f"✅ Removed **{member.display_name}** from the session.", ephemeral=True
         )
@@ -349,11 +355,13 @@ class Session(commands.Cog):
 
     @app_commands.command(name="session_players", description="Show all players in the current session.")
     async def session_players(self, interaction: discord.Interaction):
-        session = await self._require_session(interaction)
+        guild_id = str(interaction.guild_id)
+        session = await self.db.get_active_session(guild_id)
         if not session:
+            await interaction.response.send_message("No active session.", ephemeral=True)
             return
 
-        players = await self.db.get_session_players(session["id"], str(interaction.guild_id))
+        players = await self.db.get_session_players(session["id"], guild_id)
         if not players:
             await interaction.response.send_message("No players in this session yet.", ephemeral=True)
             return
@@ -370,8 +378,10 @@ class Session(commands.Cog):
     @app_commands.command(name="clear_players", description="Remove all players from the session roster.")
     @is_session_owner()
     async def clear_players(self, interaction: discord.Interaction):
-        session = await self._require_session(interaction)
+        guild_id = str(interaction.guild_id)
+        session = await self.db.get_active_session(guild_id)
         if not session:
+            await interaction.response.send_message("No active session.", ephemeral=True)
             return
 
         db = self.db

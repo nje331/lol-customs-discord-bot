@@ -3,6 +3,8 @@ services:
     build: .
     container_name: lol-bot
     restart: unless-stopped
+    ports:
+      - 5433:5433
     env_file:
       - .env
     volumes:
