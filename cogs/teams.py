@@ -1,12 +1,6 @@
 """
 Teams Cog
 Handles: random teams, captain draft, role assignment, voice moving, game results.
-
-Flow:
-  _finalize_teams()  →  shows teams + "Start Game" button  (StartGameView)
-  "Start Game" click →  moves players to VCs, saves DB records, shows winner buttons  (WinnerView)
-  winner click       →  saves result, moves everyone back, shows NextGameView
-  NextGameView       →  re-draft / random / rematch options
 """
 
 import discord
@@ -17,8 +11,6 @@ from typing import Optional
 
 from utils import ROLES, ROLE_EMOJIS, LANE_ORDER, build_embed, is_session_owner, sort_by_lane
 
-
-# ── Pure helpers ─────────────────────────────────────────────────────────────
 
 def _balance_by_power(players: list, use_power: bool) -> tuple[list, list]:
     pool = players[:]
@@ -40,13 +32,14 @@ def _assign_roles(team: list, session_role_history: dict, track_roles: bool) -> 
     taken_roles: set[str] = set()
     unassigned = list(team)
 
+    # First pass: assign by preference
     for player in list(unassigned):
         prefs = player.get("role_prefs", [])
         if track_roles:
             played = session_role_history.get(player["discord_id"], [])
             available_prefs = [r for r in prefs if r not in played]
             if not available_prefs:
-                available_prefs = prefs  # all roles played, reset for this player
+                available_prefs = prefs  # all roles played this session, reset
         else:
             available_prefs = prefs
 
@@ -57,6 +50,7 @@ def _assign_roles(team: list, session_role_history: dict, track_roles: bool) -> 
                 unassigned.remove(player)
                 break
 
+    # Second pass: fill remaining with leftover roles
     remaining_roles = [r for r in ROLES if r not in taken_roles]
     random.shuffle(remaining_roles)
     for player in unassigned:
@@ -80,14 +74,34 @@ def _team_field_no_roles(team: list) -> str:
     return "\n".join(f"• {p['display_name']}" for p in team)
 
 
+def _pick_captains_randomly(players: list, past_captain_ids: list[str]) -> tuple[dict, dict]:
+    """
+    Pick 2 captains from players. Prefer players who haven't been captain yet.
+    If all have been captain (or only 1 hasn't), reset and pick from full pool.
+    Handles odd player counts — the extra player just goes to whichever team ends up smaller.
+    """
+    never_captain = [p for p in players if p["discord_id"] not in past_captain_ids]
+
+    if len(never_captain) >= 2:
+        picks = random.sample(never_captain, 2)
+    elif len(never_captain) == 1:
+        # One fresh captain + one repeat from the pool (exclude the fresh one)
+        repeat_pool = [p for p in players if p["discord_id"] != never_captain[0]["discord_id"]]
+        picks = [never_captain[0], random.choice(repeat_pool)]
+    else:
+        # Everyone has been captain — full reset, pick any 2
+        picks = random.sample(players, 2)
+
+    return picks[0], picks[1]
+
+
 class NextGameView(discord.ui.View):
     """Buttons shown after a game result is recorded."""
 
-    def __init__(self, session_id: int, session: dict, settings: dict, players: list,
+    def __init__(self, session_id: int, settings: dict, players: list,
                  team1: list, team2: list, cog):
         super().__init__(timeout=None)
         self.session_id = session_id
-        self.session = session
         self.settings = settings
         self.all_players = players
         self.team1 = team1
@@ -101,7 +115,7 @@ class NextGameView(discord.ui.View):
         team1, team2 = _balance_by_power(self.all_players, use_power=False)
         await self.cog._finalize_teams(
             interaction, self.session_id, team1, team2, self.settings,
-            assign_roles=True, follow_up=True
+            assign_roles=True, send_mode="followup"
         )
 
     @discord.ui.button(label="Random Teams, No Roles", style=discord.ButtonStyle.secondary, emoji="🔀", row=0)
@@ -111,47 +125,39 @@ class NextGameView(discord.ui.View):
         team1, team2 = _balance_by_power(self.all_players, use_power=False)
         await self.cog._finalize_teams(
             interaction, self.session_id, team1, team2, self.settings,
-            assign_roles=False, follow_up=True
+            assign_roles=False, send_mode="followup"
         )
 
     @discord.ui.button(label="Rematch (Swap Sides)", style=discord.ButtonStyle.secondary, emoji="🔁", row=0)
     async def rematch(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
         await interaction.response.defer()
-        # Swap team1 and team2
         await self.cog._finalize_teams(
             interaction, self.session_id, self.team2, self.team1, self.settings,
-            assign_roles=True, follow_up=True
+            assign_roles=True, send_mode="followup"
         )
 
     @discord.ui.button(label="Captain Draft", style=discord.ButtonStyle.success, emoji="🎯", row=1)
     async def captain_draft(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
-        if len(self.all_players) < 3:
-            await interaction.response.send_message("Need at least 3 players for a draft.", ephemeral=True)
+        if len(self.all_players) < 4:
+            await interaction.response.send_message("Need at least 4 players for a draft.", ephemeral=True)
             return
+        db = self.cog.db
+        guild_id = str(interaction.guild_id)
+        past_captains = await db.get_past_captains(self.session_id, guild_id)
         view = CaptainDraftView(
             session_id=self.session_id,
             players=self.all_players,
-            db=self.cog.db,
+            db=db,
             guild=interaction.guild,
             settings=self.settings,
-            cog=self.cog
+            cog=self.cog,
+            past_captain_ids=past_captains
         )
         await interaction.response.edit_message(embed=view._get_embed(), view=view)
 
 
-<<<<<<< HEAD
-class CaptainDraftView(discord.ui.View):
-    """
-<<<<<<< HEAD
-    Snake draft: pick captains (manually or randomly) then alternate picks.
-    Snake order: 1, 2, 2, 1, 1, 2, 2, 1 ...
-=======
-    Snake draft: pick captain 1, captain 2, then alternate picks.
-    Select options use discord_id as value so they survive label changes.
->>>>>>> parent of b14a484 (fixed last bugs)
-=======
 class WinnerView(discord.ui.View):
     """Buttons for declaring the winning team."""
 
@@ -184,7 +190,7 @@ class WinnerView(discord.ui.View):
         for p in losers:
             await self.db.increment_games(p["discord_id"], p["guild_id"], won=False)
 
-        # Move everyone back
+        # Move everyone back to lobby
         dest_id = self.lobby_ch_id or self.team1_ch_id
         if dest_id:
             dest_ch = self.guild.get_channel(dest_id)
@@ -198,11 +204,8 @@ class WinnerView(discord.ui.View):
                             pass
 
         win_label = "🔵 Team 1" if winner == 1 else "🔴 Team 2"
-
-        session = await self.db.get_active_session(str(interaction.guild_id))
         next_view = NextGameView(
             session_id=self.session_id,
-            session=session,
             settings=self.settings,
             players=self.all_players,
             team1=self.team1,
@@ -227,27 +230,44 @@ class WinnerView(discord.ui.View):
 
 class CaptainDraftView(discord.ui.View):
     """
-    Snake draft: pick captain 1, captain 2, then alternate picks.
-    Select options use discord_id as value so they survive label changes.
+    Snake draft: pick captains (manually or randomly) then alternate picks.
+    Uses discord_id as select option values to avoid any name-lookup issues.
+    Snake order: 1, 2, 2, 1, 1, 2, 2, 1 ...
+    Odd players: last player goes to whichever team is smaller after pool is exhausted.
     """
 
     def __init__(self, session_id: int, players: list, db, guild: discord.Guild,
-                 settings: dict, cog):
+                 settings: dict, cog, past_captain_ids: list[str] = None,
+                 auto_captains: bool = False):
         super().__init__(timeout=300)
         self.session_id = session_id
-        # Build a stable lookup: discord_id -> player dict
         self.player_map: dict[str, dict] = {p["discord_id"]: p for p in players}
-        self.pool: list[str] = [p["discord_id"] for p in players]  # remaining ids
+        self.pool: list[str] = [p["discord_id"] for p in players]
         self.db = db
         self.guild = guild
         self.settings = settings
         self.cog = cog
+        self.past_captain_ids = past_captain_ids or []
         self.team1: list[str] = []
         self.team2: list[str] = []
         self.captain1_id: str = None
         self.captain2_id: str = None
-        self.phase = "pick_captain1"
+        # snake_pick_index tracks position *after* both captains are picked
+        self.snake_pick_index: int = 0
         self.turn = 1
+
+        if auto_captains:
+            self.phase = "draft"
+            cap1, cap2 = _pick_captains_randomly(players, self.past_captain_ids)
+            self.captain1_id = cap1["discord_id"]
+            self.captain2_id = cap2["discord_id"]
+            self.team1.append(self.captain1_id)
+            self.team2.append(self.captain2_id)
+            self.pool.remove(self.captain1_id)
+            self.pool.remove(self.captain2_id)
+        else:
+            self.phase = "pick_captain1"
+
         self._build_buttons()
 
     def _player_option(self, did: str) -> discord.SelectOption:
@@ -261,25 +281,33 @@ class CaptainDraftView(discord.ui.View):
 
     def _build_buttons(self):
         self.clear_items()
-        if self.phase in ("pick_captain1", "pick_captain2"):
-            label = "Pick Team 1 Captain..." if self.phase == "pick_captain1" else "Pick Team 2 Captain..."
-            select = discord.ui.Select(
-                placeholder=label,
+        if self.phase == "pick_captain1":
+            sel = discord.ui.Select(
+                placeholder="Pick Team 1 Captain...",
                 options=[self._player_option(did) for did in self.pool]
             )
-            select.callback = self._on_captain_pick
-            self.add_item(select)
+            sel.callback = self._on_captain_pick
+            self.add_item(sel)
+
+        elif self.phase == "pick_captain2":
+            sel = discord.ui.Select(
+                placeholder="Pick Team 2 Captain...",
+                options=[self._player_option(did) for did in self.pool]
+            )
+            sel.callback = self._on_captain_pick
+            self.add_item(sel)
+
         elif self.phase == "draft" and self.pool:
-            team_label = "🔵 Team 1" if self.turn == 1 else "🔴 Team 2"
-            captain_name = self.player_map[
+            cap_name = self.player_map[
                 self.captain1_id if self.turn == 1 else self.captain2_id
             ]["display_name"]
-            select = discord.ui.Select(
-                placeholder=f"{team_label} ({captain_name}): pick a player...",
+            team_label = "🔵 Team 1" if self.turn == 1 else "🔴 Team 2"
+            sel = discord.ui.Select(
+                placeholder=f"{team_label} ({cap_name}): pick a player...",
                 options=[self._player_option(did) for did in self.pool]
             )
-            select.callback = self._on_draft_pick
-            self.add_item(select)
+            sel.callback = self._on_draft_pick
+            self.add_item(sel)
 
     def _get_embed(self) -> discord.Embed:
         if self.phase == "pick_captain1":
@@ -288,38 +316,55 @@ class CaptainDraftView(discord.ui.View):
             return build_embed("Draft — Pick Team 2 Captain", "Select a player to captain Team 2.", "red")
 
         def fmt_team(ids: list[str], captain_id: str) -> str:
+            if not ids:
+                return "_empty_"
             lines = []
             for did in ids:
                 p = self.player_map[did]
                 crown = "👑 " if did == captain_id else ""
                 roles = " / ".join(p.get("role_prefs", [])) or "Fill"
                 lines.append(f"{crown}{p['display_name']} ({roles})")
-            return "\n".join(lines) or "_empty_"
+            return "\n".join(lines)
 
-        pool_lines = []
-        for did in self.pool:
-            p = self.player_map[did]
-            roles = " / ".join(p.get("role_prefs", [])) or "No preference"
-            pool_lines.append(f"• **{p['display_name']}** — {roles}")
+        pool_lines = [
+            f"• **{self.player_map[did]['display_name']}** — "
+            f"{' / '.join(self.player_map[did].get('role_prefs', [])) or 'No preference'}"
+            for did in self.pool
+        ]
 
-        turn_label = "🔵 Team 1" if self.turn == 1 else "🔴 Team 2"
-        cap_name = self.player_map[
-            self.captain1_id if self.turn == 1 else self.captain2_id
-        ]["display_name"]
-        embed = build_embed(
-            f"Draft — {turn_label} ({cap_name})'s Pick",
-            "**Available:**\n" + "\n".join(pool_lines),
-            "blue" if self.turn == 1 else "red"
-        )
-        embed.add_field(name="🔵 Team 1", value=fmt_team(self.team1, self.captain1_id), inline=True)
-        embed.add_field(name="🔴 Team 2", value=fmt_team(self.team2, self.captain2_id), inline=True)
+        cap1_name = self.player_map[self.captain1_id]["display_name"] if self.captain1_id else "?"
+        cap2_name = self.player_map[self.captain2_id]["display_name"] if self.captain2_id else "?"
+
+        if self.pool:
+            turn_cap = cap1_name if self.turn == 1 else cap2_name
+            turn_label = "🔵 Team 1" if self.turn == 1 else "🔴 Team 2"
+            title = f"Draft — {turn_label} ({turn_cap})'s Pick"
+            color = "blue" if self.turn == 1 else "red"
+        else:
+            title = "Draft — All Players Picked!"
+            color = "green"
+
+        embed = build_embed(title, "**Available:**\n" + "\n".join(pool_lines) if pool_lines else "All picked!", color)
+        embed.add_field(name=f"🔵 Team 1 (cap: {cap1_name})", value=fmt_team(self.team1, self.captain1_id), inline=True)
+        embed.add_field(name=f"🔴 Team 2 (cap: {cap2_name})", value=fmt_team(self.team2, self.captain2_id), inline=True)
         return embed
+
+    def _advance_turn(self):
+        """Snake draft turn order: 1,2,2,1,1,2,2,1,..."""
+        # snake_pick_index is 0-based position after captains have been picked
+        # At index 0: team1 just picked (their captain pick), next is team2
+        # Pattern: each team picks twice before flipping, except at very start
+        # Sequence of turns: 1,2,2,1,1,2,2,1,...
+        # turn at index i = 1 if (i // 2) % 2 == 0 else 2
+        self.snake_pick_index += 1
+        self.turn = 1 if (self.snake_pick_index // 2) % 2 == 0 else 2
 
     async def _on_captain_pick(self, interaction: discord.Interaction):
         did = interaction.data["values"][0]
         if did not in self.pool:
             await interaction.response.send_message("That player was already picked.", ephemeral=True)
             return
+
         self.pool.remove(did)
 
         if self.phase == "pick_captain1":
@@ -334,6 +379,7 @@ class CaptainDraftView(discord.ui.View):
 
         self._build_buttons()
         await interaction.response.edit_message(embed=self._get_embed(), view=self)
+
         if not self.pool:
             await self._finish(interaction)
 
@@ -342,40 +388,45 @@ class CaptainDraftView(discord.ui.View):
         if did not in self.pool:
             await interaction.response.send_message("That player was already picked.", ephemeral=True)
             return
-        self.pool.remove(did)
 
+        self.pool.remove(did)
         if self.turn == 1:
             self.team1.append(did)
         else:
             self.team2.append(did)
 
-        # Snake: flip turn, but at start/end of each "round" pick twice
-        # Simple alternating for now; true snake is: 1,2,2,1,1,2,2...
-        # Track picks since last switch
-        picks_so_far = len(self.team1) + len(self.team2)
-        # After cap picks (2 picks), we do: 1,2,2,1,1,2,2,1...
-        # Position in snake (0-indexed, after 2 captain picks)
-        pos = picks_so_far - 2
-        # Snake pattern: turn = 1 if (pos // 2) % 2 == 0 else 2
-        self.turn = 1 if (pos // 2) % 2 == 0 else 2
-
+        self._advance_turn()
         self._build_buttons()
-        await interaction.response.edit_message(embed=self._get_embed(), view=self)
 
-        if not self.pool:
+        if self.pool:
+            # More picks to go — just update the message
+            await interaction.response.edit_message(embed=self._get_embed(), view=self)
+        else:
+            # Pool is empty — handle odd player: already assigned to smaller team above
+            # Now finalize. We must respond to this interaction first, then edit to winner view.
+            # Use edit_message to respond, then do DB work, then edit again via message.edit()
+            self.stop()
+            await interaction.response.edit_message(embed=self._get_embed(), view=None)
             await self._finish(interaction)
 
     async def _finish(self, interaction: discord.Interaction):
-        self.stop()
+        """Called after all players are picked. interaction has already been responded to."""
         team1 = [self.player_map[did] for did in self.team1]
         team2 = [self.player_map[did] for did in self.team2]
+
+        # Record captains in DB
+        guild_id = str(interaction.guild_id)
+        if self.captain1_id:
+            await self.db.add_captain(self.session_id, self.captain1_id, guild_id)
+        if self.captain2_id:
+            await self.db.add_captain(self.session_id, self.captain2_id, guild_id)
+
+        # _finalize_teams will use message.edit() since interaction is already responded
         await self.cog._finalize_teams(
             interaction, self.session_id, team1, team2,
-            self.settings, assign_roles=True, follow_up=False, edit=True
+            self.settings, assign_roles=True, send_mode="message_edit"
         )
 
-
-# ── Cog ───────────────────────────────────────────────────────────────────────
 
 class Teams(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -396,21 +447,24 @@ class Teams(commands.Cog):
     async def _finalize_teams(self, interaction: discord.Interaction, session_id: int,
                                team1: list, team2: list, settings: dict,
                                assign_roles: bool = True,
-                               follow_up: bool = False,
-                               edit: bool = False):
+                               send_mode: str = "send"):
+        """
+        send_mode:
+          "send"         → interaction.response.send_message  (fresh slash command)
+          "followup"     → interaction.followup.send           (after defer())
+          "message_edit" → interaction.message.edit()          (interaction already responded)
+        """
         guild_id = str(interaction.guild_id)
         session = await self.db.get_active_session(guild_id)
         track_roles = bool(session.get("track_roles", 1)) if session else True
-        game_num = (session["game_number"] + 1) if session else 1
 
-        # Assign roles now (preview), but DON'T save to DB yet — that happens on Start Game
         team1_assign = {}
         team2_assign = {}
+
         if assign_roles:
             history = await self._get_role_history(session_id, team1 + team2, guild_id)
             team1_assign = _assign_roles(team1, history, track_roles)
             team2_assign = _assign_roles(team2, history, track_roles)
-            # Save role history
             for did, role in {**team1_assign, **team2_assign}.items():
                 if role != "Fill":
                     await self.db.add_role_history(session_id, did, guild_id, role)
@@ -460,28 +514,30 @@ class Teams(commands.Cog):
                 embed.set_footer(text=f"Players moved to {t1_ch.name} / {t2_ch.name}")
         elif not t1_ch_id:
             embed.set_footer(text="Tip: use /configure_channels to enable auto voice splits")
->>>>>>> parent of b14a484 (fixed last bugs)
 
         all_players = team1 + team2
-        start_view = StartGameView(
+        winner_view = WinnerView(
+            game_id=game_id,
             session_id=session_id,
             team1=team1,
             team2=team2,
-            team1_assign=team1_assign,
-            team2_assign=team2_assign,
-            assign_roles=assign_roles,
+            team1_ch_id=t1_ch_id,
+            team2_ch_id=t2_ch_id,
+            lobby_ch_id=lobby_id,
+            db=self.db,
+            guild=interaction.guild,
             settings=settings,
-            game_num=game_num,
             all_players=all_players,
             cog=self
         )
 
-        if edit:
-            await interaction.response.edit_message(embed=embed, view=winner_view)
-        elif follow_up:
-            await interaction.followup.send(embed=embed, view=winner_view)
-        else:
+        if send_mode == "send":
             await interaction.response.send_message(embed=embed, view=winner_view)
+        elif send_mode == "followup":
+            await interaction.followup.send(embed=embed, view=winner_view)
+        elif send_mode == "message_edit":
+            # interaction already responded — use the underlying message object
+            await interaction.message.edit(embed=embed, view=winner_view)
 
     # ── /make_teams ────────────────────────────────────────────────────────────
 
@@ -494,22 +550,22 @@ class Teams(commands.Cog):
     async def make_teams(self, interaction: discord.Interaction,
                           assign_roles: bool = True,
                           use_power: bool = False):
-        guild_id = str(interaction.guild_id)
-        session = await self.db.get_active_session(guild_id)
+        session = await self.db.get_active_session(str(interaction.guild_id))
         if not session:
             await interaction.response.send_message("No active session.", ephemeral=True)
             return
 
-        players = await self.db.get_session_players(session["id"], guild_id)
+        players = await self.db.get_session_players(session["id"], str(interaction.guild_id))
         if len(players) < 2:
             await interaction.response.send_message("Need at least 2 players in the session.", ephemeral=True)
             return
 
-        settings = await self.db.get_settings(guild_id)
+        settings = await self.db.get_settings(str(interaction.guild_id))
 
         if use_power and not settings.get("use_power_rankings"):
             await interaction.response.send_message(
-                "Power rankings are disabled. Enable with `/toggle_setting`.", ephemeral=True
+                "Power rankings are disabled. Enable with `/toggle_setting`.",
+                ephemeral=True
             )
             return
 
@@ -517,7 +573,7 @@ class Teams(commands.Cog):
         await interaction.response.defer()
         await self._finalize_teams(
             interaction, session["id"], team1, team2, settings,
-            assign_roles=assign_roles, follow_up=True
+            assign_roles=assign_roles, send_mode="followup"
         )
 
     # ── /start_draft ──────────────────────────────────────────────────────────
@@ -526,40 +582,50 @@ class Teams(commands.Cog):
         name="start_draft",
         description="Start a captain snake draft — captains alternate picking players."
     )
+    @app_commands.describe(
+        random_captains="Automatically pick captains (rotates who hasn't been captain yet)"
+    )
     @is_session_owner()
-    async def start_draft(self, interaction: discord.Interaction):
+    async def start_draft(self, interaction: discord.Interaction, random_captains: bool = False):
         session = await self.db.get_active_session(str(interaction.guild_id))
->>>>>>> parent of b14a484 (fixed last bugs)
         if not session:
             await interaction.response.send_message("No active session.", ephemeral=True)
             return
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-        players = await self.db.get_session_players(session["id"], guild_id)
+        players = await self.db.get_session_players(session["id"], str(interaction.guild_id))
         if len(players) < 3:
-=======
-        players = await self.db.get_session_players(session["id"], str(interaction.guild_id))
-        if len(players) < 4:
->>>>>>> parent of b14a484 (fixed last bugs)
-=======
-        players = await self.db.get_session_players(session["id"], str(interaction.guild_id))
-        if len(players) < 4:
             await interaction.response.send_message(
-                "Need at least 4 players for a draft.", ephemeral=True
+                "Need at least 3 players for a draft (2 captains + 1 to pick).", ephemeral=True
             )
             return
 
         settings = await self.db.get_settings(str(interaction.guild_id))
+        guild_id = str(interaction.guild_id)
+        past_captains = await self.db.get_past_captains(session["id"], guild_id)
+
         view = CaptainDraftView(
             session_id=session["id"],
             players=players,
             db=self.db,
             guild=interaction.guild,
             settings=settings,
-            cog=self
+            cog=self,
+            past_captain_ids=past_captains,
+            auto_captains=random_captains
         )
-        await interaction.response.send_message(embed=view._get_embed(), view=view)
+
+        if random_captains:
+            cap1_name = view.player_map[view.captain1_id]["display_name"]
+            cap2_name = view.player_map[view.captain2_id]["display_name"]
+            embed = view._get_embed()
+            embed.description = (
+                f"👑 **{cap1_name}** is captaining Team 1\n"
+                f"👑 **{cap2_name}** is captaining Team 2\n\n"
+                + (embed.description or "")
+            )
+            await interaction.response.send_message(embed=embed, view=view)
+        else:
+            await interaction.response.send_message(embed=view._get_embed(), view=view)
 
 
 async def setup(bot: commands.Bot):
