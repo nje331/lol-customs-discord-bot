@@ -4,6 +4,7 @@ Database module - handles all SQLite operations via aiosqlite.
 
 import aiosqlite
 import json
+import os
 from typing import Optional
 
 
@@ -25,11 +26,17 @@ class Database:
                 discord_id   TEXT NOT NULL,
                 guild_id     TEXT NOT NULL,
                 display_name TEXT NOT NULL,
-                role_prefs   TEXT DEFAULT '[]',  -- JSON list of up to 5 roles in priority order
+                role_prefs   TEXT DEFAULT '[]',
                 games_played INTEGER DEFAULT 0,
                 games_won    INTEGER DEFAULT 0,
                 games_lost   INTEGER DEFAULT 0,
-                power_weight REAL DEFAULT 5.0,   -- admin-defined 1-10 weight
+                power_weight REAL DEFAULT 5.0,
+                PRIMARY KEY (discord_id, guild_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS bot_admins (
+                discord_id   TEXT NOT NULL,
+                guild_id     TEXT NOT NULL,
                 PRIMARY KEY (discord_id, guild_id)
             );
 
@@ -38,17 +45,18 @@ class Database:
                 team1_channel_id    TEXT,
                 team2_channel_id    TEXT,
                 lobby_channel_id    TEXT,
-                use_power_rankings  INTEGER DEFAULT 0,  -- 0=off, 1=on
-                track_session_roles INTEGER DEFAULT 0   -- avoid repeating roles in session
+                use_power_rankings  INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS sessions (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id     TEXT NOT NULL,
-                started_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
-                ended_at     DATETIME,
-                is_active    INTEGER DEFAULT 1,
-                game_number  INTEGER DEFAULT 0
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id         TEXT NOT NULL,
+                owner_id         TEXT NOT NULL DEFAULT '',
+                started_at       DATETIME DEFAULT CURRENT_TIMESTAMP,
+                ended_at         DATETIME,
+                is_active        INTEGER DEFAULT 1,
+                game_number      INTEGER DEFAULT 0,
+                track_roles      INTEGER DEFAULT 1
             );
 
             CREATE TABLE IF NOT EXISTS session_players (
@@ -71,14 +79,58 @@ class Database:
                 session_id   INTEGER,
                 guild_id     TEXT,
                 game_number  INTEGER,
-                team1_ids    TEXT,  -- JSON list of discord_ids
+                team1_ids    TEXT,
                 team2_ids    TEXT,
-                winner_team  INTEGER  -- 1 or 2, NULL if pending
+                winner_team  INTEGER
             );
         """)
+        # Migrations for existing databases
+        try:
+            await self.db.execute("ALTER TABLE sessions ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
+            await self.db.commit()
+        except Exception:
+            pass
+        try:
+            await self.db.execute("ALTER TABLE sessions ADD COLUMN track_roles INTEGER DEFAULT 1")
+            await self.db.commit()
+        except Exception:
+            pass
+        try:
+            await self.db.execute("ALTER TABLE guild_settings DROP COLUMN track_session_roles")
+            await self.db.commit()
+        except Exception:
+            pass
         await self.db.commit()
 
-    # ── Player CRUD ─────────────────────────────────────────────────────────
+    # ── Bot Admins ───────────────────────────────────────────────────────────
+
+    async def is_bot_admin(self, discord_id: str, guild_id: str) -> bool:
+        async with self.db.execute(
+            "SELECT 1 FROM bot_admins WHERE discord_id=? AND guild_id=?",
+            (discord_id, guild_id)
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def add_bot_admin(self, discord_id: str, guild_id: str):
+        await self.db.execute(
+            "INSERT OR IGNORE INTO bot_admins VALUES (?, ?)", (discord_id, guild_id)
+        )
+        await self.db.commit()
+
+    async def remove_bot_admin(self, discord_id: str, guild_id: str):
+        await self.db.execute(
+            "DELETE FROM bot_admins WHERE discord_id=? AND guild_id=?", (discord_id, guild_id)
+        )
+        await self.db.commit()
+
+    async def get_bot_admins(self, guild_id: str) -> list[str]:
+        async with self.db.execute(
+            "SELECT discord_id FROM bot_admins WHERE guild_id=?", (guild_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [r["discord_id"] for r in rows]
+
+    # ── Player CRUD ──────────────────────────────────────────────────────────
 
     async def upsert_player(self, discord_id: str, guild_id: str, display_name: str,
                              role_prefs: list = None):
@@ -160,9 +212,10 @@ class Database:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
-    async def create_session(self, guild_id: str) -> int:
+    async def create_session(self, guild_id: str, owner_id: str, track_roles: bool = True) -> int:
         cursor = await self.db.execute(
-            "INSERT INTO sessions (guild_id) VALUES (?)", (guild_id,)
+            "INSERT INTO sessions (guild_id, owner_id, track_roles) VALUES (?, ?, ?)",
+            (guild_id, owner_id, 1 if track_roles else 0)
         )
         await self.db.commit()
         return cursor.lastrowid
@@ -257,9 +310,9 @@ class Database:
 
     async def get_leaderboard(self, guild_id: str) -> list[dict]:
         async with self.db.execute("""
-            SELECT *, 
-                   CASE WHEN games_played > 0 
-                        THEN ROUND(CAST(games_won AS FLOAT)/games_played*100, 1) 
+            SELECT *,
+                   CASE WHEN games_played > 0
+                        THEN ROUND(CAST(games_won AS FLOAT)/games_played*100, 1)
                         ELSE 0 END AS win_rate
             FROM players
             WHERE guild_id=? AND games_played > 0
@@ -270,7 +323,7 @@ class Database:
             for row in rows:
                 d = dict(row)
                 d["role_prefs"] = json.loads(d["role_prefs"])
-                return result
+                result.append(d)
             return result
 
     # ── Guild Settings ───────────────────────────────────────────────────────
@@ -282,14 +335,12 @@ class Database:
             row = await cursor.fetchone()
             if row:
                 return dict(row)
-            # Return defaults
             return {
                 "guild_id": guild_id,
                 "team1_channel_id": None,
                 "team2_channel_id": None,
                 "lobby_channel_id": None,
                 "use_power_rankings": 0,
-                "track_session_roles": 0,
             }
 
     async def update_setting(self, guild_id: str, key: str, value):

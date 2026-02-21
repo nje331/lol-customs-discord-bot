@@ -1,13 +1,18 @@
 """
 Players Cog
-Handles: player registration, role preferences, stats, leaderboard.
+Handles: player registration, role preferences, stats, leaderboard, bot admin management.
 """
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from utils import ROLES, ROLE_EMOJIS, build_embed, fmt_player, is_admin
+from utils import ROLES, ROLE_EMOJIS, build_embed, fmt_player, is_admin, check_is_admin
+
+
+def _build_role_select_view(author_id: int, callback, existing: list = None):
+    """Build and return a RoleSelectView."""
+    return RoleSelectView(author_id, callback, existing=existing or [])
 
 
 class RoleSelectView(discord.ui.View):
@@ -27,7 +32,7 @@ class RoleSelectView(discord.ui.View):
 
         if remaining and len(self.selected) < 5:
             select = discord.ui.Select(
-                placeholder=f"Pick role #{len(self.selected)+1} (priority order)…",
+                placeholder=f"Pick role #{len(self.selected)+1} (priority order)...",
                 options=[
                     discord.SelectOption(
                         label=r,
@@ -41,19 +46,20 @@ class RoleSelectView(discord.ui.View):
 
         if self.selected:
             done_btn = discord.ui.Button(
-                label=f"✅ Done ({len(self.selected)} selected)",
-                style=discord.ButtonStyle.success
+                label=f"Done ({len(self.selected)} selected)",
+                style=discord.ButtonStyle.success,
+                emoji="✅"
             )
             done_btn.callback = self._on_done
             self.add_item(done_btn)
 
-            clear_btn = discord.ui.Button(label="🔄 Reset", style=discord.ButtonStyle.secondary)
+            clear_btn = discord.ui.Button(label="Reset", style=discord.ButtonStyle.secondary, emoji="🔄")
             clear_btn.callback = self._on_reset
             self.add_item(clear_btn)
 
         if self.existing:
             keep_btn = discord.ui.Button(
-                label="Keep existing preferences",
+                label="Keep existing",
                 style=discord.ButtonStyle.secondary
             )
             keep_btn.callback = self._on_keep
@@ -78,7 +84,7 @@ class RoleSelectView(discord.ui.View):
         role = interaction.data["values"][0]
         self.selected.append(role)
         self._rebuild()
-        chosen = " → ".join(f"{ROLE_EMOJIS[r]}{r}" for r in self.selected)
+        chosen = " > ".join(f"{ROLE_EMOJIS[r]} {r}" for r in self.selected)
         await interaction.response.edit_message(
             content=f"Priority order so far: {chosen}",
             view=self
@@ -120,10 +126,8 @@ class Players(commands.Cog):
     def db(self):
         return self.bot.db
 
-    # ── /register ────────────────────────────────────────────────────────────
-
-    @app_commands.command(name="register", description="Register with the LoL bot and set role preferences.")
-    async def register(self, interaction: discord.Interaction):
+    async def _run_register_flow(self, interaction: discord.Interaction):
+        """Shared logic for register and edit_roles."""
         existing = await self.db.get_player(str(interaction.user.id), str(interaction.guild_id))
 
         async def _save(inter: discord.Interaction, roles: list):
@@ -133,9 +137,9 @@ class Players(commands.Cog):
                 inter.user.display_name,
                 roles
             )
-            role_str = " → ".join(f"{ROLE_EMOJIS[r]}{r}" for r in roles) if roles else "No preference (fill any role)"
+            role_str = " > ".join(f"{ROLE_EMOJIS[r]} {r}" for r in roles) if roles else "No preference (fill any role)"
             embed = build_embed(
-                "✅ Registered!",
+                "Registered!",
                 f"**{inter.user.display_name}**\nRole preferences: {role_str}",
                 "green"
             )
@@ -149,6 +153,12 @@ class Players(commands.Cog):
         msg = "Update your role preferences:" if existing else "Welcome! Set your role preferences (priority order):"
         await interaction.response.send_message(msg, view=view, ephemeral=True)
 
+    # ── /register ────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="register", description="Register with the LoL bot and set role preferences.")
+    async def register(self, interaction: discord.Interaction):
+        await self._run_register_flow(interaction)
+
     # ── /edit_roles ──────────────────────────────────────────────────────────
 
     @app_commands.command(name="edit_roles", description="Update your role preferences.")
@@ -156,11 +166,10 @@ class Players(commands.Cog):
         player = await self.db.get_player(str(interaction.user.id), str(interaction.guild_id))
         if not player:
             await interaction.response.send_message(
-                "You're not registered yet! Use `/register` first.", ephemeral=True
+                "You're not registered yet. Use `/register` first.", ephemeral=True
             )
             return
-        # Re-use register flow
-        await self.register(interaction)
+        await self._run_register_flow(interaction)
 
     # ── /unregister ──────────────────────────────────────────────────────────
 
@@ -171,6 +180,8 @@ class Players(commands.Cog):
             await interaction.response.send_message("You're not registered.", ephemeral=True)
             return
 
+        db = self.db
+
         class ConfirmView(discord.ui.View):
             def __init__(self):
                 super().__init__(timeout=30)
@@ -178,11 +189,9 @@ class Players(commands.Cog):
             @discord.ui.button(label="Yes, remove me", style=discord.ButtonStyle.danger)
             async def confirm(self, btn_inter: discord.Interaction, button: discord.ui.Button):
                 self.stop()
-                await btn_inter.client.db.delete_player(
-                    str(btn_inter.user.id), str(btn_inter.guild_id)
-                )
+                await db.delete_player(str(btn_inter.user.id), str(btn_inter.guild_id))
                 await btn_inter.response.edit_message(
-                    content="✅ You have been removed from the database.", view=None
+                    content="You have been removed from the database.", view=None
                 )
 
             @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -191,7 +200,7 @@ class Players(commands.Cog):
                 await btn_inter.response.edit_message(content="Cancelled.", view=None)
 
         await interaction.response.send_message(
-            "⚠️ Are you sure? This will delete your stats and preferences.",
+            "Are you sure? This will delete your stats and preferences.",
             view=ConfirmView(), ephemeral=True
         )
 
@@ -212,9 +221,9 @@ class Players(commands.Cog):
         gw = player["games_won"]
         gl = player["games_lost"]
         wr = round(gw / gp * 100, 1) if gp > 0 else 0
-        roles = " → ".join(f"{ROLE_EMOJIS.get(r,'')}{r}" for r in player["role_prefs"]) or "No preference"
+        roles = " > ".join(f"{ROLE_EMOJIS.get(r, r)} {r}" for r in player["role_prefs"]) or "No preference"
 
-        embed = build_embed(f"📊 Stats — {player['display_name']}", color_key="gold")
+        embed = build_embed(f"Stats — {player['display_name']}", color_key="gold")
         embed.add_field(name="Games Played", value=str(gp), inline=True)
         embed.add_field(name="Wins", value=str(gw), inline=True)
         embed.add_field(name="Losses", value=str(gl), inline=True)
@@ -241,7 +250,7 @@ class Players(commands.Cog):
                 f"{rank} **{p['display_name']}** — {p['games_won']}W/{p['games_lost']}L ({wr}%)"
             )
 
-        embed = build_embed("🏆 Leaderboard", "\n".join(lines), "gold")
+        embed = build_embed("Leaderboard", "\n".join(lines), "gold")
         await interaction.response.send_message(embed=embed)
 
     # ── Admin: /admin_register ────────────────────────────────────────────────
@@ -257,7 +266,7 @@ class Players(commands.Cog):
 
     # ── Admin: /set_weight ────────────────────────────────────────────────────
 
-    @app_commands.command(name="set_weight", description="[Admin] Set a player's power ranking weight (1–10).")
+    @app_commands.command(name="set_weight", description="[Admin] Set a player's power ranking weight (1-10).")
     @app_commands.describe(member="The player", weight="Power weight 1 (weakest) to 10 (strongest)")
     @is_admin()
     async def set_weight(self, interaction: discord.Interaction, member: discord.Member, weight: float):
@@ -281,7 +290,41 @@ class Players(commands.Cog):
             await interaction.response.send_message("No players registered.", ephemeral=True)
             return
         lines = [f"**{p['display_name']}** — Weight: **{p['power_weight']}**" for p in players]
-        embed = build_embed("⚖️ Power Weights (Admin Only)", "\n".join(lines), "gray")
+        embed = build_embed("Power Weights (Admin Only)", "\n".join(lines), "gray")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ── Admin: /add_bot_admin / /remove_bot_admin ─────────────────────────────
+
+    @app_commands.command(name="add_bot_admin", description="[Admin] Grant a user bot-admin privileges.")
+    @app_commands.describe(member="The member to promote")
+    @is_admin()
+    async def add_bot_admin(self, interaction: discord.Interaction, member: discord.Member):
+        await self.db.add_bot_admin(str(member.id), str(interaction.guild_id))
+        await interaction.response.send_message(
+            f"✅ **{member.display_name}** is now a bot admin.", ephemeral=True
+        )
+
+    @app_commands.command(name="remove_bot_admin", description="[Admin] Remove a user's bot-admin privileges.")
+    @app_commands.describe(member="The member to demote")
+    @is_admin()
+    async def remove_bot_admin(self, interaction: discord.Interaction, member: discord.Member):
+        await self.db.remove_bot_admin(str(member.id), str(interaction.guild_id))
+        await interaction.response.send_message(
+            f"✅ **{member.display_name}** is no longer a bot admin.", ephemeral=True
+        )
+
+    @app_commands.command(name="list_bot_admins", description="[Admin] List all bot admins in this server.")
+    @is_admin()
+    async def list_bot_admins(self, interaction: discord.Interaction):
+        admin_ids = await self.db.get_bot_admins(str(interaction.guild_id))
+        if not admin_ids:
+            await interaction.response.send_message("No custom bot admins set.", ephemeral=True)
+            return
+        lines = []
+        for did in admin_ids:
+            member = interaction.guild.get_member(int(did))
+            lines.append(f"• {member.display_name if member else f'Unknown ({did})'}")
+        embed = build_embed("Bot Admins", "\n".join(lines), "gray")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
