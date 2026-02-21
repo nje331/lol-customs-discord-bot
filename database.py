@@ -74,13 +74,6 @@ class Database:
                 PRIMARY KEY (session_id, discord_id, guild_id, role)
             );
 
-            CREATE TABLE IF NOT EXISTS session_captain_history (
-                session_id   INTEGER,
-                discord_id   TEXT,
-                guild_id     TEXT,
-                PRIMARY KEY (session_id, discord_id, guild_id)
-            );
-
             CREATE TABLE IF NOT EXISTS games (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id   INTEGER,
@@ -91,16 +84,22 @@ class Database:
                 winner_team  INTEGER
             );
         """)
-        # Safe migrations for existing databases
-        for migration in [
-            "ALTER TABLE sessions ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE sessions ADD COLUMN track_roles INTEGER DEFAULT 1",
-        ]:
-            try:
-                await self.db.execute(migration)
-                await self.db.commit()
-            except Exception:
-                pass
+        # Migrations for existing databases
+        try:
+            await self.db.execute("ALTER TABLE sessions ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
+            await self.db.commit()
+        except Exception:
+            pass
+        try:
+            await self.db.execute("ALTER TABLE sessions ADD COLUMN track_roles INTEGER DEFAULT 1")
+            await self.db.commit()
+        except Exception:
+            pass
+        try:
+            await self.db.execute("ALTER TABLE guild_settings DROP COLUMN track_session_roles")
+            await self.db.commit()
+        except Exception:
+            pass
         await self.db.commit()
 
     # ── Bot Admins ───────────────────────────────────────────────────────────
@@ -281,24 +280,6 @@ class Database:
         ) as cursor:
             rows = await cursor.fetchall()
             return [r["role"] for r in rows]
-
-    # ── Session Captain History ──────────────────────────────────────────────
-
-    async def add_captain(self, session_id: int, discord_id: str, guild_id: str):
-        await self.db.execute(
-            "INSERT OR IGNORE INTO session_captain_history VALUES (?, ?, ?)",
-            (session_id, discord_id, guild_id)
-        )
-        await self.db.commit()
-
-    async def get_past_captains(self, session_id: int, guild_id: str) -> list[str]:
-        """Returns list of discord_ids who have been captain this session."""
-        async with self.db.execute(
-            "SELECT discord_id FROM session_captain_history WHERE session_id=? AND guild_id=?",
-            (session_id, guild_id)
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return [r["discord_id"] for r in rows]
 
     # ── Games ────────────────────────────────────────────────────────────────
 
