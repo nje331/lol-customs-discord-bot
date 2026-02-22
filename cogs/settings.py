@@ -166,7 +166,7 @@ class Settings(commands.Cog):
                 "`/add_player @p1 [@p2...]` — Add up to 5 players at once\n"
                 "`/remove_player [member]` — Remove a player\n"
                 "`/clear_players` — Clear the roster\n"
-                "`/make_teams` — Random split + optional role assignment\n"
+                "`/make_teams` — Random split + optional role assignment + optional champion assignment\n"
                 "`/start_draft` — Captain snake draft"
             ), inline=False)
 
@@ -178,6 +178,7 @@ class Settings(commands.Cog):
                 "`/admin_register [member]` — Manually register a player\n"
                 "`/set_weight [member] [1-10]` — Set power ranking weight\n"
                 "`/view_weights` — View all power weights\n"
+                "`/update_champs` — Update champion role statistics\n"
                 "`/add_bot_admin [member]` — Grant bot admin to a user\n"
                 "`/remove_bot_admin [member]` — Revoke bot admin\n"
                 "`/list_bot_admins` — List all bot admins"
