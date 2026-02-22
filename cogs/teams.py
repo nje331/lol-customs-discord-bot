@@ -164,7 +164,7 @@ class WinnerView(discord.ui.View):
     def __init__(self, game_id: int, session_id: int, team1: list, team2: list,
                  team1_ch_id: Optional[int], team2_ch_id: Optional[int],
                  lobby_ch_id: Optional[int], db, guild: discord.Guild,
-                 settings: dict, all_players: list, cog):
+                 settings: dict, all_players: list, cog, not_picked: list = None):
         super().__init__(timeout=None)
         self.game_id = game_id
         self.session_id = session_id
@@ -178,6 +178,7 @@ class WinnerView(discord.ui.View):
         self.settings = settings
         self.all_players = all_players
         self.cog = cog
+        self.not_picked = not_picked or []
 
     async def _record_winner(self, interaction: discord.Interaction, winner: int):
         self.stop()
@@ -190,12 +191,12 @@ class WinnerView(discord.ui.View):
         for p in losers:
             await self.db.increment_games(p["discord_id"], p["guild_id"], won=False)
 
-        # Move everyone back to lobby
+        # Move everyone (including not_picked) back to lobby
         dest_id = self.lobby_ch_id or self.team1_ch_id
         if dest_id:
             dest_ch = self.guild.get_channel(dest_id)
             if dest_ch:
-                for p in self.team1 + self.team2:
+                for p in self.team1 + self.team2 + self.not_picked:
                     member = self.guild.get_member(int(p["discord_id"]))
                     if member and member.voice:
                         try:
@@ -447,13 +448,16 @@ class Teams(commands.Cog):
     async def _finalize_teams(self, interaction: discord.Interaction, session_id: int,
                                team1: list, team2: list, settings: dict,
                                assign_roles: bool = True,
-                               send_mode: str = "send"):
+                               send_mode: str = "send",
+                               not_picked: list = None):
         """
         send_mode:
           "send"         → interaction.response.send_message  (fresh slash command)
           "followup"     → interaction.followup.send           (after defer())
           "message_edit" → interaction.message.edit()          (interaction already responded)
+        not_picked: players over 10; they go to team 1 VC, get no win/loss, and game number is not incremented.
         """
+        not_picked = not_picked or []
         guild_id = str(interaction.guild_id)
         session = await self.db.get_active_session(guild_id)
         track_roles = bool(session.get("track_roles", 1)) if session else True
@@ -469,7 +473,9 @@ class Teams(commands.Cog):
                 if role != "Fill":
                     await self.db.add_role_history(session_id, did, guild_id, role)
 
-        await self.db.increment_session_game(session_id)
+        # Only increment session game when everyone is playing (no not_picked); then game number in title stays same for overflow games
+        if not not_picked:
+            await self.db.increment_session_game(session_id)
         session = await self.db.get_active_session(guild_id)
         game_num = session["game_number"] if session else 1
 
@@ -487,8 +493,10 @@ class Teams(commands.Cog):
         else:
             embed.add_field(name="🔵 Team 1", value=_team_field_no_roles(team1), inline=True)
             embed.add_field(name="🔴 Team 2", value=_team_field_no_roles(team2), inline=True)
+        if not_picked:
+            embed.add_field(name="Not Picked (no W/L)", value=_team_field_no_roles(not_picked), inline=False)
 
-        # Move players to VC
+        # Move players to VC (not_picked go to team 1 channel)
         t1_ch_id = int(settings["team1_channel_id"]) if settings.get("team1_channel_id") else None
         t2_ch_id = int(settings["team2_channel_id"]) if settings.get("team2_channel_id") else None
         lobby_id = int(settings["lobby_channel_id"]) if settings.get("lobby_channel_id") else None
@@ -511,11 +519,18 @@ class Teams(commands.Cog):
                             await m.move_to(t2_ch)
                         except discord.Forbidden:
                             pass
+                for p in not_picked:
+                    m = interaction.guild.get_member(int(p["discord_id"]))
+                    if m and m.voice:
+                        try:
+                            await m.move_to(t1_ch)
+                        except discord.Forbidden:
+                            pass
                 embed.set_footer(text=f"Players moved to {t1_ch.name} / {t2_ch.name}")
         elif not t1_ch_id:
             embed.set_footer(text="Tip: use /configure_channels to enable auto voice splits")
 
-        all_players = team1 + team2
+        all_players = team1 + team2 + not_picked
         winner_view = WinnerView(
             game_id=game_id,
             session_id=session_id,
@@ -528,7 +543,8 @@ class Teams(commands.Cog):
             guild=interaction.guild,
             settings=settings,
             all_players=all_players,
-            cog=self
+            cog=self,
+            not_picked=not_picked
         )
 
         if send_mode == "send":
@@ -569,11 +585,19 @@ class Teams(commands.Cog):
             )
             return
 
-        team1, team2 = _balance_by_power(players, use_power=use_power)
+        team1_full, team2_full = _balance_by_power(players, use_power=use_power)
+        if len(players) > 10:
+            team1 = team1_full[:5]
+            team2 = team2_full[:5]
+            not_picked = team1_full[5:] + team2_full[5:]
+        else:
+            team1, team2 = team1_full, team2_full
+            not_picked = []
+
         await interaction.response.defer()
         await self._finalize_teams(
             interaction, session["id"], team1, team2, settings,
-            assign_roles=assign_roles, send_mode="followup"
+            assign_roles=assign_roles, send_mode="followup", not_picked=not_picked
         )
 
     # ── /start_draft ──────────────────────────────────────────────────────────
