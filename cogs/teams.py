@@ -1,6 +1,13 @@
 """
 Teams Cog
-Handles: random teams, captain draft, role assignment, voice moving, game results.
+Handles: random teams, captain draft, role assignment, random champion assignment,
+         voice moving, game results.
+
+Flow:
+  _finalize_teams()  →  shows teams + "Start Game" button  (StartGameView)
+  "Start Game" click →  moves players to VCs, saves DB records, shows WinnerView
+  winner click       →  saves result, moves everyone back, shows NextGameView
+  NextGameView       →  re-draft / random / rematch / random-champs options
 """
 
 import discord
@@ -11,6 +18,17 @@ from typing import Optional
 
 from utils import ROLES, ROLE_EMOJIS, LANE_ORDER, build_embed, is_session_owner, sort_by_lane
 
+# Map our role names → CommunityDragon role keys used in the champions table
+ROLE_TO_CDR = {
+    "Top":     "TOP",
+    "Jungle":  "JUNGLE",
+    "Mid":     "MIDDLE",
+    "ADC":     "BOTTOM",
+    "Support": "SUPPORT",
+}
+
+
+# ── Pure helpers ──────────────────────────────────────────────────────────────
 
 def _balance_by_power(players: list, use_power: bool) -> tuple[list, list]:
     pool = players[:]
@@ -32,14 +50,13 @@ def _assign_roles(team: list, session_role_history: dict, track_roles: bool) -> 
     taken_roles: set[str] = set()
     unassigned = list(team)
 
-    # First pass: assign by preference
     for player in list(unassigned):
         prefs = player.get("role_prefs", [])
         if track_roles:
             played = session_role_history.get(player["discord_id"], [])
             available_prefs = [r for r in prefs if r not in played]
             if not available_prefs:
-                available_prefs = prefs  # all roles played this session, reset
+                available_prefs = prefs
         else:
             available_prefs = prefs
 
@@ -50,7 +67,6 @@ def _assign_roles(team: list, session_role_history: dict, track_roles: bool) -> 
                 unassigned.remove(player)
                 break
 
-    # Second pass: fill remaining with leftover roles
     remaining_roles = [r for r in ROLES if r not in taken_roles]
     random.shuffle(remaining_roles)
     for player in unassigned:
@@ -60,177 +76,233 @@ def _assign_roles(team: list, session_role_history: dict, track_roles: bool) -> 
     return assignment
 
 
-def _team_field(team: list, assignments: dict) -> str:
+async def _assign_champs(assignments: dict[str, str], db) -> dict[str, str]:
+    """
+    Given {discord_id: role}, returns {discord_id: champion_name}.
+    Picks a random champion weighted by play rate for each role.
+    If no champion data exists for a role, returns empty string for that player.
+    Ensures no champion is assigned twice in the same game.
+    """
+    champ_assignment: dict[str, str] = {}
+    used_champs: set[str] = set()
+
+    for did, role in assignments.items():
+        cdr_role = ROLE_TO_CDR.get(role)
+        if not cdr_role:
+            champ_assignment[did] = ""
+            continue
+
+        # Fetch all champions for this role ordered by play rate
+        rows = await db.get_champions_for_role(cdr_role, limit=50)
+        if not rows:
+            champ_assignment[did] = ""
+            continue
+
+        # Filter out already-used champs, then weighted-random pick
+        available = [r for r in rows if r["name"] not in used_champs]
+        if not available:
+            available = rows  # fallback: allow repeats if pool exhausted
+
+        # Weighted random by play rate (higher play rate = more likely to appear)
+        weights = [max(r["play_rate"], 0.001) for r in available]
+        chosen = random.choices(available, weights=weights, k=1)[0]
+        champ_assignment[did] = chosen["name"]
+        used_champs.add(chosen["name"])
+
+    return champ_assignment
+
+
+def _team_field(team: list, assignments: dict,
+                champ_assignments: dict | None = None) -> str:
+    """Render a team embed field. Optionally includes champion name per player."""
     sorted_team = sort_by_lane(team, assignments)
     lines = []
     for p in sorted_team:
         role = assignments.get(p["discord_id"], "Fill")
         emoji = ROLE_EMOJIS.get(role, "❓")
-        lines.append(f"{emoji} **{role}** — {p['display_name']}")
+        champ = champ_assignments.get(p["discord_id"], "") if champ_assignments else ""
+        champ_str = f" *({champ})*" if champ else ""
+        lines.append(f"{emoji} **{role}** — {p['display_name']}{champ_str}")
     return "\n".join(lines)
 
 
-def _team_field_no_roles(team: list) -> str:
-    return "\n".join(f"• {p['display_name']}" for p in team)
+def _team_field_no_roles(team: list,
+                          champ_assignments: dict | None = None) -> str:
+    """Render a team embed field with no roles. Optionally includes champion name."""
+    lines = []
+    for p in team:
+        champ = champ_assignments.get(p["discord_id"], "") if champ_assignments else ""
+        champ_str = f" *({champ})*" if champ else ""
+        lines.append(f"• {p['display_name']}{champ_str}")
+    return "\n".join(lines)
 
 
 def _pick_captains_randomly(players: list, past_captain_ids: list[str]) -> tuple[dict, dict]:
-    """
-    Pick 2 captains from players. Prefer players who haven't been captain yet.
-    If all have been captain (or only 1 hasn't), reset and pick from full pool.
-    Handles odd player counts — the extra player just goes to whichever team ends up smaller.
-    """
     never_captain = [p for p in players if p["discord_id"] not in past_captain_ids]
-
     if len(never_captain) >= 2:
         picks = random.sample(never_captain, 2)
     elif len(never_captain) == 1:
-        # One fresh captain + one repeat from the pool (exclude the fresh one)
         repeat_pool = [p for p in players if p["discord_id"] != never_captain[0]["discord_id"]]
         picks = [never_captain[0], random.choice(repeat_pool)]
     else:
-        # Everyone has been captain — full reset, pick any 2
         picks = random.sample(players, 2)
-
     return picks[0], picks[1]
 
 
-class NextGameView(discord.ui.View):
-    """Buttons shown after a game result is recorded."""
+async def _move_players_to_channels(
+    guild: discord.Guild,
+    team1: list, team2: list,
+    t1_ch_id: Optional[int], t2_ch_id: Optional[int]
+) -> str:
+    if not (t1_ch_id and t2_ch_id):
+        return "Tip: use /configure_channels to enable auto voice splits"
+    t1_ch = guild.get_channel(t1_ch_id)
+    t2_ch = guild.get_channel(t2_ch_id)
+    if not (t1_ch and t2_ch):
+        return "⚠️ Configured voice channels not found"
+    for p in team1:
+        m = guild.get_member(int(p["discord_id"]))
+        if m and m.voice:
+            try:
+                await m.move_to(t1_ch)
+            except discord.Forbidden:
+                pass
+    for p in team2:
+        m = guild.get_member(int(p["discord_id"]))
+        if m and m.voice:
+            try:
+                await m.move_to(t2_ch)
+            except discord.Forbidden:
+                pass
+    return f"Players moved → {t1_ch.name} / {t2_ch.name}"
 
-    def __init__(self, session_id: int, settings: dict, players: list,
-                 team1: list, team2: list, cog):
-        super().__init__(timeout=None)
-        self.session_id = session_id
-        self.settings = settings
-        self.all_players = players
-        self.team1 = team1
-        self.team2 = team2
-        self.cog = cog
 
-    @discord.ui.button(label="Random Teams + Roles", style=discord.ButtonStyle.primary, emoji="🎲", row=0)
-    async def random_with_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.stop()
-        await interaction.response.defer()
-        team1, team2 = _balance_by_power(self.all_players, use_power=False)
-        await self.cog._finalize_teams(
-            interaction, self.session_id, team1, team2, self.settings,
-            assign_roles=True, send_mode="followup"
-        )
-
-    @discord.ui.button(label="Random Teams, No Roles", style=discord.ButtonStyle.secondary, emoji="🔀", row=0)
-    async def random_no_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.stop()
-        await interaction.response.defer()
-        team1, team2 = _balance_by_power(self.all_players, use_power=False)
-        await self.cog._finalize_teams(
-            interaction, self.session_id, team1, team2, self.settings,
-            assign_roles=False, send_mode="followup"
-        )
-
-    @discord.ui.button(label="Rematch (Swap Sides)", style=discord.ButtonStyle.secondary, emoji="🔁", row=0)
-    async def rematch(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.stop()
-        await interaction.response.defer()
-        await self.cog._finalize_teams(
-            interaction, self.session_id, self.team2, self.team1, self.settings,
-            assign_roles=True, send_mode="followup"
-        )
-
-    @discord.ui.button(label="Captain Draft", style=discord.ButtonStyle.success, emoji="🎯", row=1)
-    async def captain_draft(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.stop()
-        if len(self.all_players) < 4:
-            await interaction.response.send_message("Need at least 4 players for a draft.", ephemeral=True)
-            return
-        db = self.cog.db
-        guild_id = str(interaction.guild_id)
-        past_captains = await db.get_past_captains(self.session_id, guild_id)
-        view = CaptainDraftView(
-            session_id=self.session_id,
-            players=self.all_players,
-            db=db,
-            guild=interaction.guild,
-            settings=self.settings,
-            cog=self.cog,
-            past_captain_ids=past_captains
-        )
-        await interaction.response.edit_message(embed=view._get_embed(), view=view)
-
+# ── Views ─────────────────────────────────────────────────────────────────────
 
 class StartGameView(discord.ui.View):
-    """Shown after teams are set. 'Start Game' moves players to voice channels and then shows win buttons."""
+    """
+    Shown after teams are set. Displays lineup and waits for 'Start Game'.
+    On click: saves DB records, moves players to VCs, swaps to WinnerView.
+    """
 
-    def __init__(self, game_id: int, session_id: int, team1: list, team2: list,
-                 team1_ch_id: Optional[int], team2_ch_id: Optional[int],
-                 lobby_ch_id: Optional[int], db, guild: discord.Guild,
-                 settings: dict, all_players: list, cog, not_picked: list = None):
+    def __init__(self, session_id: int, team1: list, team2: list,
+                 team1_assign: dict, team2_assign: dict,
+                 team1_champs: dict, team2_champs: dict,
+                 assign_roles: bool, random_champs: bool,
+                 settings: dict, game_num: int, all_players: list, cog):
         super().__init__(timeout=None)
-        self.game_id = game_id
         self.session_id = session_id
         self.team1 = team1
         self.team2 = team2
-        self.team1_ch_id = team1_ch_id
-        self.team2_ch_id = team2_ch_id
-        self.lobby_ch_id = lobby_ch_id
-        self.db = db
-        self.guild = guild
+        self.team1_assign = team1_assign
+        self.team2_assign = team2_assign
+        self.team1_champs = team1_champs   # {discord_id: champ_name} or {}
+        self.team2_champs = team2_champs
+        self.assign_roles = assign_roles
+        self.random_champs = random_champs
         self.settings = settings
+        self.game_num = game_num
         self.all_players = all_players
         self.cog = cog
-        self.not_picked = not_picked or []
 
-    @discord.ui.button(label="Start Game", style=discord.ButtonStyle.success, emoji="▶️")
+    def build_embed(self, title_suffix: str = "Teams Ready",
+                    description: str = "Review the teams below, then press **Start Game** to begin.",
+                    color: str = "blue") -> discord.Embed:
+        embed = build_embed(f"Game #{self.game_num} — {title_suffix}", description, color)
+
+        champs1 = self.team1_champs if self.random_champs else None
+        champs2 = self.team2_champs if self.random_champs else None
+
+        if self.assign_roles:
+            embed.add_field(name="🔵 Team 1", value=_team_field(self.team1, self.team1_assign, champs1), inline=True)
+            embed.add_field(name="🔴 Team 2", value=_team_field(self.team2, self.team2_assign, champs2), inline=True)
+        else:
+            embed.add_field(name="🔵 Team 1", value=_team_field_no_roles(self.team1, champs1), inline=True)
+            embed.add_field(name="🔴 Team 2", value=_team_field_no_roles(self.team2, champs2), inline=True)
+
+        if self.random_champs:
+            patch = None
+            # Try to get patch from any champ data the DB has
+            embed.set_footer(text="Champions randomly assigned by play rate")
+
+        return embed
+
+    @discord.ui.button(label="Start Game", style=discord.ButtonStyle.success, emoji="▶️", row=0)
     async def start_game(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
-        await interaction.response.defer()
+        guild_id = str(interaction.guild_id)
+        db = self.cog.db
 
-        # Move players to team voice channels
-        if self.team1_ch_id and self.team2_ch_id:
-            t1_ch = self.guild.get_channel(self.team1_ch_id)
-            t2_ch = self.guild.get_channel(self.team2_ch_id)
-            if t1_ch and t2_ch:
-                for p in self.team1:
-                    m = self.guild.get_member(int(p["discord_id"]))
-                    if m and m.voice:
-                        try:
-                            await m.move_to(t1_ch)
-                        except discord.Forbidden:
-                            pass
-                for p in self.team2:
-                    m = self.guild.get_member(int(p["discord_id"]))
-                    if m and m.voice:
-                        try:
-                            await m.move_to(t2_ch)
-                        except discord.Forbidden:
-                            pass
-                for p in self.not_picked:
-                    m = self.guild.get_member(int(p["discord_id"]))
-                    if m and m.voice:
-                        try:
-                            await m.move_to(t1_ch)
-                        except discord.Forbidden:
-                            pass
+        # Save role history
+        if self.assign_roles:
+            for did, role in {**self.team1_assign, **self.team2_assign}.items():
+                if role != "Fill":
+                    await db.add_role_history(self.session_id, did, guild_id, role)
+
+        # Increment game counter and create game record
+        await db.increment_session_game(self.session_id)
+        session = await db.get_active_session(guild_id)
+        actual_game_num = session["game_number"] if session else self.game_num
+
+        game_id = await db.create_game(
+            self.session_id, guild_id, actual_game_num,
+            [p["discord_id"] for p in self.team1],
+            [p["discord_id"] for p in self.team2]
+        )
+
+        # Move players
+        t1_ch_id = int(self.settings["team1_channel_id"]) if self.settings.get("team1_channel_id") else None
+        t2_ch_id = int(self.settings["team2_channel_id"]) if self.settings.get("team2_channel_id") else None
+        lobby_id = int(self.settings["lobby_channel_id"]) if self.settings.get("lobby_channel_id") else None
+
+        footer = await _move_players_to_channels(
+            interaction.guild, self.team1, self.team2, t1_ch_id, t2_ch_id
+        )
+
+        # Build in-progress embed (same layout, different header)
+        embed = self.build_embed(
+            title_suffix=f"#{actual_game_num} — In Progress",
+            description="Good luck! Click the winning team when the game ends.",
+            color="gold"
+        )
+        embed.set_footer(text=footer)
 
         winner_view = WinnerView(
-            game_id=self.game_id,
+            game_id=game_id,
             session_id=self.session_id,
             team1=self.team1,
             team2=self.team2,
-            team1_ch_id=self.team1_ch_id,
-            team2_ch_id=self.team2_ch_id,
-            lobby_ch_id=self.lobby_ch_id,
-            db=self.db,
-            guild=self.guild,
+            team1_ch_id=t1_ch_id,
+            team2_ch_id=t2_ch_id,
+            lobby_ch_id=lobby_id,
+            db=db,
+            guild=interaction.guild,
             settings=self.settings,
             all_players=self.all_players,
-            cog=self.cog,
-            not_picked=self.not_picked,
+            cog=self.cog
         )
-        embed = interaction.message.embeds[0] if interaction.message.embeds else build_embed("Game — Teams Set!", "Session", "blue")
-        if embed.footer.text and "Start Game" in embed.footer.text:
-            embed.set_footer(text="Players moved to voice. Declare the winner when the game ends.")
-        await interaction.message.edit(embed=embed, view=winner_view)
+        await interaction.response.edit_message(embed=embed, view=winner_view)
+
+    @discord.ui.button(label="Re-roll Teams", style=discord.ButtonStyle.secondary, emoji="🎲", row=0)
+    async def reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.defer()
+        team1, team2 = _balance_by_power(self.all_players, use_power=False)
+        await self.cog._finalize_teams(
+            interaction, self.session_id, team1, team2, self.settings,
+            assign_roles=self.assign_roles, random_champs=self.random_champs,
+            send_mode="message_edit"
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="✖️", row=0)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        embed = build_embed(
+            "Teams Cancelled",
+            "No game was started. Use `/make_teams` or `/start_draft` to try again.",
+            "gray"
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
 
 
 class WinnerView(discord.ui.View):
@@ -239,7 +311,7 @@ class WinnerView(discord.ui.View):
     def __init__(self, game_id: int, session_id: int, team1: list, team2: list,
                  team1_ch_id: Optional[int], team2_ch_id: Optional[int],
                  lobby_ch_id: Optional[int], db, guild: discord.Guild,
-                 settings: dict, all_players: list, cog, not_picked: list = None):
+                 settings: dict, all_players: list, cog):
         super().__init__(timeout=None)
         self.game_id = game_id
         self.session_id = session_id
@@ -253,7 +325,6 @@ class WinnerView(discord.ui.View):
         self.settings = settings
         self.all_players = all_players
         self.cog = cog
-        self.not_picked = not_picked or []
 
     async def _record_winner(self, interaction: discord.Interaction, winner: int):
         self.stop()
@@ -266,12 +337,11 @@ class WinnerView(discord.ui.View):
         for p in losers:
             await self.db.increment_games(p["discord_id"], p["guild_id"], won=False)
 
-        # Move everyone (including not_picked) back to lobby
         dest_id = self.lobby_ch_id or self.team1_ch_id
         if dest_id:
             dest_ch = self.guild.get_channel(dest_id)
             if dest_ch:
-                for p in self.team1 + self.team2 + self.not_picked:
+                for p in self.team1 + self.team2:
                     member = self.guild.get_member(int(p["discord_id"]))
                     if member and member.voice:
                         try:
@@ -304,12 +374,96 @@ class WinnerView(discord.ui.View):
         await self._record_winner(interaction, 2)
 
 
+class NextGameView(discord.ui.View):
+    """Buttons shown after a game result is recorded."""
+
+    def __init__(self, session_id: int, settings: dict, players: list,
+                 team1: list, team2: list, cog):
+        super().__init__(timeout=None)
+        self.session_id = session_id
+        self.settings = settings
+        self.all_players = players
+        self.team1 = team1
+        self.team2 = team2
+        self.cog = cog
+
+    # Row 0: random team options
+    @discord.ui.button(label="Random + Roles", style=discord.ButtonStyle.primary, emoji="🎲", row=0)
+    async def random_with_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.defer()
+        team1, team2 = _balance_by_power(self.all_players, use_power=False)
+        await self.cog._finalize_teams(
+            interaction, self.session_id, team1, team2, self.settings,
+            assign_roles=True, random_champs=False, send_mode="followup"
+        )
+
+    @discord.ui.button(label="Random, No Roles", style=discord.ButtonStyle.secondary, emoji="🔀", row=0)
+    async def random_no_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.defer()
+        team1, team2 = _balance_by_power(self.all_players, use_power=False)
+        await self.cog._finalize_teams(
+            interaction, self.session_id, team1, team2, self.settings,
+            assign_roles=False, random_champs=False, send_mode="followup"
+        )
+
+    @discord.ui.button(label="Rematch", style=discord.ButtonStyle.secondary, emoji="🔁", row=0)
+    async def rematch(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.defer()
+        await self.cog._finalize_teams(
+            interaction, self.session_id, self.team2, self.team1, self.settings,
+            assign_roles=True, random_champs=False, send_mode="followup"
+        )
+
+    # Row 1: random champion options
+    @discord.ui.button(label="Random Champs + Roles", style=discord.ButtonStyle.primary, emoji="🎰", row=1)
+    async def random_champs_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.defer()
+        team1, team2 = _balance_by_power(self.all_players, use_power=False)
+        await self.cog._finalize_teams(
+            interaction, self.session_id, team1, team2, self.settings,
+            assign_roles=True, random_champs=True, send_mode="followup"
+        )
+
+    @discord.ui.button(label="Random Champs, No Roles", style=discord.ButtonStyle.secondary, emoji="🎰", row=1)
+    async def random_champs_no_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.defer()
+        team1, team2 = _balance_by_power(self.all_players, use_power=False)
+        await self.cog._finalize_teams(
+            interaction, self.session_id, team1, team2, self.settings,
+            assign_roles=False, random_champs=True, send_mode="followup"
+        )
+
+    # Row 2: draft
+    @discord.ui.button(label="Captain Draft", style=discord.ButtonStyle.success, emoji="🎯", row=2)
+    async def captain_draft(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        if len(self.all_players) < 3:
+            await interaction.response.send_message("Need at least 3 players for a draft.", ephemeral=True)
+            return
+        db = self.cog.db
+        guild_id = str(interaction.guild_id)
+        past_captains = await db.get_past_captains(self.session_id, guild_id)
+        view = CaptainDraftView(
+            session_id=self.session_id,
+            players=self.all_players,
+            db=db,
+            guild=interaction.guild,
+            settings=self.settings,
+            cog=self.cog,
+            past_captain_ids=past_captains
+        )
+        await interaction.response.edit_message(embed=view._get_embed(), view=view)
+
+
 class CaptainDraftView(discord.ui.View):
     """
     Snake draft: pick captains (manually or randomly) then alternate picks.
-    Uses discord_id as select option values to avoid any name-lookup issues.
     Snake order: 1, 2, 2, 1, 1, 2, 2, 1 ...
-    Odd players: last player goes to whichever team is smaller after pool is exhausted.
     """
 
     def __init__(self, session_id: int, players: list, db, guild: discord.Guild,
@@ -328,7 +482,6 @@ class CaptainDraftView(discord.ui.View):
         self.team2: list[str] = []
         self.captain1_id: str = None
         self.captain2_id: str = None
-        # snake_pick_index tracks position *after* both captains are picked
         self.snake_pick_index: int = 0
         self.turn = 1
 
@@ -364,7 +517,6 @@ class CaptainDraftView(discord.ui.View):
             )
             sel.callback = self._on_captain_pick
             self.add_item(sel)
-
         elif self.phase == "pick_captain2":
             sel = discord.ui.Select(
                 placeholder="Pick Team 2 Captain...",
@@ -372,7 +524,6 @@ class CaptainDraftView(discord.ui.View):
             )
             sel.callback = self._on_captain_pick
             self.add_item(sel)
-
         elif self.phase == "draft" and self.pool:
             cap_name = self.player_map[
                 self.captain1_id if self.turn == 1 else self.captain2_id
@@ -416,22 +567,18 @@ class CaptainDraftView(discord.ui.View):
             turn_label = "🔵 Team 1" if self.turn == 1 else "🔴 Team 2"
             title = f"Draft — {turn_label} ({turn_cap})'s Pick"
             color = "blue" if self.turn == 1 else "red"
+            desc = "**Available:**\n" + "\n".join(pool_lines)
         else:
             title = "Draft — All Players Picked!"
             color = "green"
+            desc = "All picked!"
 
-        embed = build_embed(title, "**Available:**\n" + "\n".join(pool_lines) if pool_lines else "All picked!", color)
+        embed = build_embed(title, desc, color)
         embed.add_field(name=f"🔵 Team 1 (cap: {cap1_name})", value=fmt_team(self.team1, self.captain1_id), inline=True)
         embed.add_field(name=f"🔴 Team 2 (cap: {cap2_name})", value=fmt_team(self.team2, self.captain2_id), inline=True)
         return embed
 
     def _advance_turn(self):
-        """Snake draft turn order: 1,2,2,1,1,2,2,1,..."""
-        # snake_pick_index is 0-based position after captains have been picked
-        # At index 0: team1 just picked (their captain pick), next is team2
-        # Pattern: each team picks twice before flipping, except at very start
-        # Sequence of turns: 1,2,2,1,1,2,2,1,...
-        # turn at index i = 1 if (i // 2) % 2 == 0 else 2
         self.snake_pick_index += 1
         self.turn = 1 if (self.snake_pick_index // 2) % 2 == 0 else 2
 
@@ -440,7 +587,6 @@ class CaptainDraftView(discord.ui.View):
         if did not in self.pool:
             await interaction.response.send_message("That player was already picked.", ephemeral=True)
             return
-
         self.pool.remove(did)
 
         if self.phase == "pick_captain1":
@@ -464,8 +610,8 @@ class CaptainDraftView(discord.ui.View):
         if did not in self.pool:
             await interaction.response.send_message("That player was already picked.", ephemeral=True)
             return
-
         self.pool.remove(did)
+
         if self.turn == 1:
             self.team1.append(did)
         else:
@@ -475,34 +621,30 @@ class CaptainDraftView(discord.ui.View):
         self._build_buttons()
 
         if self.pool:
-            # More picks to go — just update the message
             await interaction.response.edit_message(embed=self._get_embed(), view=self)
         else:
-            # Pool is empty — handle odd player: already assigned to smaller team above
-            # Now finalize. We must respond to this interaction first, then edit to winner view.
-            # Use edit_message to respond, then do DB work, then edit again via message.edit()
             self.stop()
             await interaction.response.edit_message(embed=self._get_embed(), view=None)
             await self._finish(interaction)
 
     async def _finish(self, interaction: discord.Interaction):
-        """Called after all players are picked. interaction has already been responded to."""
-        team1 = [self.player_map[did] for did in self.team1]
-        team2 = [self.player_map[did] for did in self.team2]
-
-        # Record captains in DB
         guild_id = str(interaction.guild_id)
         if self.captain1_id:
             await self.db.add_captain(self.session_id, self.captain1_id, guild_id)
         if self.captain2_id:
             await self.db.add_captain(self.session_id, self.captain2_id, guild_id)
 
-        # _finalize_teams will use message.edit() since interaction is already responded
+        team1 = [self.player_map[did] for did in self.team1]
+        team2 = [self.player_map[did] for did in self.team2]
+
         await self.cog._finalize_teams(
             interaction, self.session_id, team1, team2,
-            self.settings, assign_roles=True, send_mode="message_edit"
+            self.settings, assign_roles=True, random_champs=False,
+            send_mode="message_edit"
         )
 
+
+# ── Cog ───────────────────────────────────────────────────────────────────────
 
 class Teams(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -523,148 +665,121 @@ class Teams(commands.Cog):
     async def _finalize_teams(self, interaction: discord.Interaction, session_id: int,
                                team1: list, team2: list, settings: dict,
                                assign_roles: bool = True,
-                               send_mode: str = "send",
-                               not_picked: list = None):
+                               random_champs: bool = False,
+                               send_mode: str = "send"):
         """
+        Builds the StartGameView and posts it.
+
         send_mode:
-          "send"         → interaction.response.send_message  (fresh slash command)
-          "followup"     → interaction.followup.send           (after defer())
-          "message_edit" → interaction.message.edit()          (interaction already responded)
-        not_picked: players over 10; they go to team 1 VC, get no win/loss, and game number is not incremented.
+          "send"         → interaction.response.send_message
+          "followup"     → interaction.followup.send  (after defer())
+          "message_edit" → interaction.message.edit() (already responded)
         """
-        not_picked = not_picked or []
         guild_id = str(interaction.guild_id)
         session = await self.db.get_active_session(guild_id)
         track_roles = bool(session.get("track_roles", 1)) if session else True
+        game_num = (session["game_number"] + 1) if session else 1
 
-        team1_assign = {}
-        team2_assign = {}
-
+        # Assign roles (preview only — not saved to DB until Start Game)
+        team1_assign: dict = {}
+        team2_assign: dict = {}
         if assign_roles:
             history = await self._get_role_history(session_id, team1 + team2, guild_id)
             team1_assign = _assign_roles(team1, history, track_roles)
             team2_assign = _assign_roles(team2, history, track_roles)
-            for did, role in {**team1_assign, **team2_assign}.items():
-                if role != "Fill":
-                    await self.db.add_role_history(session_id, did, guild_id, role)
 
-        # Only increment session game when everyone is playing (no not_picked); then game number in title stays same for overflow games
-        if not not_picked:
-            await self.db.increment_session_game(session_id)
-        session = await self.db.get_active_session(guild_id)
-        game_num = session["game_number"] if session else 1
+        # Assign random champions if requested
+        team1_champs: dict = {}
+        team2_champs: dict = {}
+        if random_champs:
+            patch = await self.db.get_champion_patch()
+            if not patch:
+                # No champion data — warn but continue without champs
+                random_champs = False
+                no_champ_warning = "\n⚠️ No champion data found — run `/update_champs` first."
+            else:
+                no_champ_warning = ""
+                if assign_roles:
+                    team1_champs = await _assign_champs(team1_assign, self.db)
+                    team2_champs = await _assign_champs(team2_assign, self.db)
+                else:
+                    # No roles — assign champs from a random role pool per player
+                    # Give each player a random role just for champ assignment purposes
+                    all_players_combined = team1 + team2
+                    temp_roles = ROLES * ((len(all_players_combined) // len(ROLES)) + 1)
+                    random.shuffle(temp_roles)
+                    temp_assign = {p["discord_id"]: temp_roles[i] for i, p in enumerate(all_players_combined)}
+                    t1_temp = {p["discord_id"]: temp_assign[p["discord_id"]] for p in team1}
+                    t2_temp = {p["discord_id"]: temp_assign[p["discord_id"]] for p in team2}
+                    team1_champs = await _assign_champs(t1_temp, self.db)
+                    team2_champs = await _assign_champs(t2_temp, self.db)
+        else:
+            no_champ_warning = ""
 
-        game_id = await self.db.create_game(
-            session_id, guild_id, game_num,
-            [p["discord_id"] for p in team1],
-            [p["discord_id"] for p in team2]
+        all_players = team1 + team2
+        start_view = StartGameView(
+            session_id=session_id,
+            team1=team1,
+            team2=team2,
+            team1_assign=team1_assign,
+            team2_assign=team2_assign,
+            team1_champs=team1_champs,
+            team2_champs=team2_champs,
+            assign_roles=assign_roles,
+            random_champs=random_champs,
+            settings=settings,
+            game_num=game_num,
+            all_players=all_players,
+            cog=self
         )
-
-        embed = build_embed(f"Game #{game_num} — Teams Set!", f"Session #{session_id}", "blue")
-
-        if assign_roles:
-            embed.add_field(name="🔵 Team 1", value=_team_field(team1, team1_assign), inline=True)
-            embed.add_field(name="🔴 Team 2", value=_team_field(team2, team2_assign), inline=True)
-        else:
-            embed.add_field(name="🔵 Team 1", value=_team_field_no_roles(team1), inline=True)
-            embed.add_field(name="🔴 Team 2", value=_team_field_no_roles(team2), inline=True)
-        if not_picked:
-            embed.add_field(name="Not Picked (no W/L)", value=_team_field_no_roles(not_picked), inline=False)
-
-        t1_ch_id = int(settings["team1_channel_id"]) if settings.get("team1_channel_id") else None
-        t2_ch_id = int(settings["team2_channel_id"]) if settings.get("team2_channel_id") else None
-        lobby_id = int(settings["lobby_channel_id"]) if settings.get("lobby_channel_id") else None
-
-        all_players = team1 + team2 + not_picked
-
-        # When voice channels are set: show Start Game button first; on press we move players then show win buttons.
-        # When not set: show win buttons directly.
-        if t1_ch_id and t2_ch_id:
-            embed.set_footer(text="Press Start Game to move players to voice channels and begin.")
-            view = StartGameView(
-                game_id=game_id,
-                session_id=session_id,
-                team1=team1,
-                team2=team2,
-                team1_ch_id=t1_ch_id,
-                team2_ch_id=t2_ch_id,
-                lobby_ch_id=lobby_id,
-                db=self.db,
-                guild=interaction.guild,
-                settings=settings,
-                all_players=all_players,
-                cog=self,
-                not_picked=not_picked,
-            )
-        else:
-            if not t1_ch_id:
-                embed.set_footer(text="Tip: use /configure_channels to enable auto voice splits")
-            view = WinnerView(
-                game_id=game_id,
-                session_id=session_id,
-                team1=team1,
-                team2=team2,
-                team1_ch_id=t1_ch_id,
-                team2_ch_id=t2_ch_id,
-                lobby_ch_id=lobby_id,
-                db=self.db,
-                guild=interaction.guild,
-                settings=settings,
-                all_players=all_players,
-                cog=self,
-                not_picked=not_picked,
-            )
+        embed = start_view.build_embed()
+        if no_champ_warning:
+            embed.description = (embed.description or "") + no_champ_warning
 
         if send_mode == "send":
-            await interaction.response.send_message(embed=embed, view=view)
+            await interaction.response.send_message(embed=embed, view=start_view)
         elif send_mode == "followup":
-            await interaction.followup.send(embed=embed, view=view)
+            await interaction.followup.send(embed=embed, view=start_view)
         elif send_mode == "message_edit":
-            await interaction.message.edit(embed=embed, view=view)
+            await interaction.message.edit(embed=embed, view=start_view)
 
     # ── /make_teams ────────────────────────────────────────────────────────────
 
     @app_commands.command(name="make_teams", description="Randomly split session players into two teams.")
     @app_commands.describe(
-        assign_roles="Automatically assign roles to players (default: True)",
-        use_power="Use power rankings to balance teams"
+        assign_roles="Assign roles based on player preferences (default: True)",
+        random_champs="Randomly assign a champion to each player (default: False)",
+        use_power="Use power rankings to balance teams (default: False)"
     )
     @is_session_owner()
     async def make_teams(self, interaction: discord.Interaction,
                           assign_roles: bool = True,
+                          random_champs: bool = False,
                           use_power: bool = False):
-        session = await self.db.get_active_session(str(interaction.guild_id))
+        guild_id = str(interaction.guild_id)
+        session = await self.db.get_active_session(guild_id)
         if not session:
             await interaction.response.send_message("No active session.", ephemeral=True)
             return
 
-        players = await self.db.get_session_players(session["id"], str(interaction.guild_id))
+        players = await self.db.get_session_players(session["id"], guild_id)
         if len(players) < 2:
             await interaction.response.send_message("Need at least 2 players in the session.", ephemeral=True)
             return
 
-        settings = await self.db.get_settings(str(interaction.guild_id))
+        settings = await self.db.get_settings(guild_id)
 
         if use_power and not settings.get("use_power_rankings"):
             await interaction.response.send_message(
-                "Power rankings are disabled. Enable with `/toggle_setting`.",
-                ephemeral=True
+                "Power rankings are disabled. Enable with `/toggle_setting`.", ephemeral=True
             )
             return
 
-        team1_full, team2_full = _balance_by_power(players, use_power=use_power)
-        if len(players) > 10:
-            team1 = team1_full[:5]
-            team2 = team2_full[:5]
-            not_picked = team1_full[5:] + team2_full[5:]
-        else:
-            team1, team2 = team1_full, team2_full
-            not_picked = []
-
+        team1, team2 = _balance_by_power(players, use_power=use_power)
         await interaction.response.defer()
         await self._finalize_teams(
             interaction, session["id"], team1, team2, settings,
-            assign_roles=assign_roles, send_mode="followup", not_picked=not_picked
+            assign_roles=assign_roles, random_champs=random_champs, send_mode="followup"
         )
 
     # ── /start_draft ──────────────────────────────────────────────────────────
@@ -674,24 +789,24 @@ class Teams(commands.Cog):
         description="Start a captain snake draft — captains alternate picking players."
     )
     @app_commands.describe(
-        random_captains="Automatically pick captains (rotates who hasn't been captain yet)"
+        random_captains="Auto-pick captains, rotating who hasn't been captain yet"
     )
     @is_session_owner()
     async def start_draft(self, interaction: discord.Interaction, random_captains: bool = False):
-        session = await self.db.get_active_session(str(interaction.guild_id))
+        guild_id = str(interaction.guild_id)
+        session = await self.db.get_active_session(guild_id)
         if not session:
             await interaction.response.send_message("No active session.", ephemeral=True)
             return
 
-        players = await self.db.get_session_players(session["id"], str(interaction.guild_id))
+        players = await self.db.get_session_players(session["id"], guild_id)
         if len(players) < 3:
             await interaction.response.send_message(
                 "Need at least 3 players for a draft (2 captains + 1 to pick).", ephemeral=True
             )
             return
 
-        settings = await self.db.get_settings(str(interaction.guild_id))
-        guild_id = str(interaction.guild_id)
+        settings = await self.db.get_settings(guild_id)
         past_captains = await self.db.get_past_captains(session["id"], guild_id)
 
         view = CaptainDraftView(
@@ -710,8 +825,8 @@ class Teams(commands.Cog):
             cap2_name = view.player_map[view.captain2_id]["display_name"]
             embed = view._get_embed()
             embed.description = (
-                f"👑 **{cap1_name}** is captaining Team 1\n"
-                f"👑 **{cap2_name}** is captaining Team 2\n\n"
+                f"👑 **{cap1_name}** captains Team 1\n"
+                f"👑 **{cap2_name}** captains Team 2\n\n"
                 + (embed.description or "")
             )
             await interaction.response.send_message(embed=embed, view=view)

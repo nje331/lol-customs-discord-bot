@@ -90,6 +90,16 @@ class Database:
                 team2_ids    TEXT,
                 winner_team  INTEGER
             );
+
+            CREATE TABLE IF NOT EXISTS champions (
+                champ_id     TEXT NOT NULL,   -- numeric champion ID as string
+                name         TEXT NOT NULL,
+                role         TEXT NOT NULL,   -- TOP, JUNGLE, MIDDLE, BOTTOM, SUPPORT
+                play_rate    REAL DEFAULT 0,
+                patch        TEXT NOT NULL,
+                updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (champ_id, role)
+            );
         """)
         # Safe migrations for existing databases
         for migration in [
@@ -373,3 +383,49 @@ class Database:
             (value, guild_id)
         )
         await self.db.commit()
+
+    # ── Champions ────────────────────────────────────────────────────────────
+
+    async def upsert_champion(self, champ_id: str, name: str, role: str,
+                               play_rate: float, patch: str):
+        await self.db.execute("""
+            INSERT INTO champions (champ_id, name, role, play_rate, patch, updated_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(champ_id, role) DO UPDATE SET
+                name       = excluded.name,
+                play_rate  = excluded.play_rate,
+                patch      = excluded.patch,
+                updated_at = CURRENT_TIMESTAMP
+        """, (champ_id, name, role, play_rate, patch))
+
+    async def commit(self):
+        await self.db.commit()
+
+    async def get_champions_for_role(self, role: str, limit: int = 10) -> list[dict]:
+        """Return top champions for a role sorted by play rate."""
+        async with self.db.execute("""
+            SELECT * FROM champions
+            WHERE role = ?
+            ORDER BY play_rate DESC
+            LIMIT ?
+        """, (role.upper(), limit)) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_champion(self, name: str) -> list[dict]:
+        """Return all role entries for a champion (case-insensitive partial match)."""
+        async with self.db.execute("""
+            SELECT * FROM champions
+            WHERE name LIKE ?
+            ORDER BY play_rate DESC
+        """, (f"%{name}%",)) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_champion_patch(self) -> str | None:
+        """Return the patch string the champion data was last synced for."""
+        async with self.db.execute(
+            "SELECT patch FROM champions ORDER BY updated_at DESC LIMIT 1"
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row["patch"] if row else None
