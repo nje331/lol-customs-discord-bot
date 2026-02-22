@@ -252,7 +252,7 @@ class StartGameView(discord.ui.View):
             )
 
         if self.random_champs:
-            embed.set_footer(text="Champions randomly assigned by play rate")
+            embed.set_footer(text="Champions randomly assigned by role")
 
         return embed
 
