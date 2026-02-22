@@ -158,6 +158,81 @@ class NextGameView(discord.ui.View):
         await interaction.response.edit_message(embed=view._get_embed(), view=view)
 
 
+class StartGameView(discord.ui.View):
+    """Shown after teams are set. 'Start Game' moves players to voice channels and then shows win buttons."""
+
+    def __init__(self, game_id: int, session_id: int, team1: list, team2: list,
+                 team1_ch_id: Optional[int], team2_ch_id: Optional[int],
+                 lobby_ch_id: Optional[int], db, guild: discord.Guild,
+                 settings: dict, all_players: list, cog, not_picked: list = None):
+        super().__init__(timeout=None)
+        self.game_id = game_id
+        self.session_id = session_id
+        self.team1 = team1
+        self.team2 = team2
+        self.team1_ch_id = team1_ch_id
+        self.team2_ch_id = team2_ch_id
+        self.lobby_ch_id = lobby_ch_id
+        self.db = db
+        self.guild = guild
+        self.settings = settings
+        self.all_players = all_players
+        self.cog = cog
+        self.not_picked = not_picked or []
+
+    @discord.ui.button(label="Start Game", style=discord.ButtonStyle.success, emoji="▶️")
+    async def start_game(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.defer()
+
+        # Move players to team voice channels
+        if self.team1_ch_id and self.team2_ch_id:
+            t1_ch = self.guild.get_channel(self.team1_ch_id)
+            t2_ch = self.guild.get_channel(self.team2_ch_id)
+            if t1_ch and t2_ch:
+                for p in self.team1:
+                    m = self.guild.get_member(int(p["discord_id"]))
+                    if m and m.voice:
+                        try:
+                            await m.move_to(t1_ch)
+                        except discord.Forbidden:
+                            pass
+                for p in self.team2:
+                    m = self.guild.get_member(int(p["discord_id"]))
+                    if m and m.voice:
+                        try:
+                            await m.move_to(t2_ch)
+                        except discord.Forbidden:
+                            pass
+                for p in self.not_picked:
+                    m = self.guild.get_member(int(p["discord_id"]))
+                    if m and m.voice:
+                        try:
+                            await m.move_to(t1_ch)
+                        except discord.Forbidden:
+                            pass
+
+        winner_view = WinnerView(
+            game_id=self.game_id,
+            session_id=self.session_id,
+            team1=self.team1,
+            team2=self.team2,
+            team1_ch_id=self.team1_ch_id,
+            team2_ch_id=self.team2_ch_id,
+            lobby_ch_id=self.lobby_ch_id,
+            db=self.db,
+            guild=self.guild,
+            settings=self.settings,
+            all_players=self.all_players,
+            cog=self.cog,
+            not_picked=self.not_picked,
+        )
+        embed = interaction.message.embeds[0] if interaction.message.embeds else build_embed("Game — Teams Set!", "Session", "blue")
+        if embed.footer.text and "Start Game" in embed.footer.text:
+            embed.set_footer(text="Players moved to voice. Declare the winner when the game ends.")
+        await interaction.message.edit(embed=embed, view=winner_view)
+
+
 class WinnerView(discord.ui.View):
     """Buttons for declaring the winning team."""
 
@@ -496,64 +571,56 @@ class Teams(commands.Cog):
         if not_picked:
             embed.add_field(name="Not Picked (no W/L)", value=_team_field_no_roles(not_picked), inline=False)
 
-        # Move players to VC (not_picked go to team 1 channel)
         t1_ch_id = int(settings["team1_channel_id"]) if settings.get("team1_channel_id") else None
         t2_ch_id = int(settings["team2_channel_id"]) if settings.get("team2_channel_id") else None
         lobby_id = int(settings["lobby_channel_id"]) if settings.get("lobby_channel_id") else None
 
-        if t1_ch_id and t2_ch_id:
-            t1_ch = interaction.guild.get_channel(t1_ch_id)
-            t2_ch = interaction.guild.get_channel(t2_ch_id)
-            if t1_ch and t2_ch:
-                for p in team1:
-                    m = interaction.guild.get_member(int(p["discord_id"]))
-                    if m and m.voice:
-                        try:
-                            await m.move_to(t1_ch)
-                        except discord.Forbidden:
-                            pass
-                for p in team2:
-                    m = interaction.guild.get_member(int(p["discord_id"]))
-                    if m and m.voice:
-                        try:
-                            await m.move_to(t2_ch)
-                        except discord.Forbidden:
-                            pass
-                for p in not_picked:
-                    m = interaction.guild.get_member(int(p["discord_id"]))
-                    if m and m.voice:
-                        try:
-                            await m.move_to(t1_ch)
-                        except discord.Forbidden:
-                            pass
-                embed.set_footer(text=f"Players moved to {t1_ch.name} / {t2_ch.name}")
-        elif not t1_ch_id:
-            embed.set_footer(text="Tip: use /configure_channels to enable auto voice splits")
-
         all_players = team1 + team2 + not_picked
-        winner_view = WinnerView(
-            game_id=game_id,
-            session_id=session_id,
-            team1=team1,
-            team2=team2,
-            team1_ch_id=t1_ch_id,
-            team2_ch_id=t2_ch_id,
-            lobby_ch_id=lobby_id,
-            db=self.db,
-            guild=interaction.guild,
-            settings=settings,
-            all_players=all_players,
-            cog=self,
-            not_picked=not_picked
-        )
+
+        # When voice channels are set: show Start Game button first; on press we move players then show win buttons.
+        # When not set: show win buttons directly.
+        if t1_ch_id and t2_ch_id:
+            embed.set_footer(text="Press Start Game to move players to voice channels and begin.")
+            view = StartGameView(
+                game_id=game_id,
+                session_id=session_id,
+                team1=team1,
+                team2=team2,
+                team1_ch_id=t1_ch_id,
+                team2_ch_id=t2_ch_id,
+                lobby_ch_id=lobby_id,
+                db=self.db,
+                guild=interaction.guild,
+                settings=settings,
+                all_players=all_players,
+                cog=self,
+                not_picked=not_picked,
+            )
+        else:
+            if not t1_ch_id:
+                embed.set_footer(text="Tip: use /configure_channels to enable auto voice splits")
+            view = WinnerView(
+                game_id=game_id,
+                session_id=session_id,
+                team1=team1,
+                team2=team2,
+                team1_ch_id=t1_ch_id,
+                team2_ch_id=t2_ch_id,
+                lobby_ch_id=lobby_id,
+                db=self.db,
+                guild=interaction.guild,
+                settings=settings,
+                all_players=all_players,
+                cog=self,
+                not_picked=not_picked,
+            )
 
         if send_mode == "send":
-            await interaction.response.send_message(embed=embed, view=winner_view)
+            await interaction.response.send_message(embed=embed, view=view)
         elif send_mode == "followup":
-            await interaction.followup.send(embed=embed, view=winner_view)
+            await interaction.followup.send(embed=embed, view=view)
         elif send_mode == "message_edit":
-            # interaction already responded — use the underlying message object
-            await interaction.message.edit(embed=embed, view=winner_view)
+            await interaction.message.edit(embed=embed, view=view)
 
     # ── /make_teams ────────────────────────────────────────────────────────────
 
