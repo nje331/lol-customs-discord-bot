@@ -48,7 +48,8 @@ class Champions(commands.Cog):
 
         await interaction.followup.send(
             f"✅ Champion data synced for **Patch {patch}** — "
-            f"**{updated_count}** champion/role entries updated."
+            f"**{updated_count}** champion/role entries updated.",
+            ephemeral=True
         )
 
     async def _fetch_and_store(self) -> tuple[str, int]:

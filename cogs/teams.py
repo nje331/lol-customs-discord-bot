@@ -1,13 +1,13 @@
 """
 Teams Cog
 Handles: random teams, captain draft, role assignment, random champion assignment,
-         voice moving, game results.
+         voice moving, game results, bench management (11+ players).
 
 Flow:
-  _finalize_teams()  →  shows teams + "Start Game" button  (StartGameView)
-  "Start Game" click →  moves players to VCs, saves DB records, shows WinnerView
-  winner click       →  saves result, moves everyone back, shows NextGameView
-  NextGameView       →  re-draft / random / rematch / random-champs options
+  _finalize_teams()  →  shows teams + bench + "Start Game" button  (StartGameView)
+  "Start Game" click →  moves playing 10 to VCs, saves DB records, shows WinnerView
+  winner click       →  saves result for playing 10 only, moves all back, shows NextGameView
+  NextGameView       →  re-draft / random / rematch / random-champs (re-rolls from full session roster)
 """
 
 import discord
@@ -17,6 +17,8 @@ import random
 from typing import Optional
 
 from utils import ROLES, ROLE_EMOJIS, LANE_ORDER, build_embed, is_session_owner, sort_by_lane
+
+TEAM_SIZE = 5   # players per team
 
 # Map our role names → CommunityDragon role keys used in the champions table
 ROLE_TO_CDR = {
@@ -30,18 +32,34 @@ ROLE_TO_CDR = {
 
 # ── Pure helpers ──────────────────────────────────────────────────────────────
 
-def _balance_by_power(players: list, use_power: bool) -> tuple[list, list]:
+def _split_players(players: list, use_power: bool) -> tuple[list, list, list]:
+    """
+    Split players into (team1, team2, bench).
+    Team size is capped at TEAM_SIZE each (10 playing total).
+    Any extras beyond 10 go to bench, randomly selected.
+    """
     pool = players[:]
+
+    if len(pool) > TEAM_SIZE * 2:
+        random.shuffle(pool)
+        playing = pool[:TEAM_SIZE * 2]
+        bench = pool[TEAM_SIZE * 2:]
+    else:
+        playing = pool
+        bench = []
+
+    # Now split playing 10 into two teams
     if use_power:
-        pool.sort(key=lambda p: p.get("power_weight", 5.0), reverse=True)
+        playing.sort(key=lambda p: p.get("power_weight", 5.0), reverse=True)
         team1, team2 = [], []
-        for i, p in enumerate(pool):
+        for i, p in enumerate(playing):
             (team1 if i % 2 == 0 else team2).append(p)
     else:
-        random.shuffle(pool)
-        mid = len(pool) // 2
-        team1, team2 = pool[:mid], pool[mid:]
-    return team1, team2
+        random.shuffle(playing)
+        mid = len(playing) // 2
+        team1, team2 = playing[:mid], playing[mid:]
+
+    return team1, team2, bench
 
 
 def _assign_roles(team: list, session_role_history: dict, track_roles: bool) -> dict[str, str]:
@@ -104,8 +122,9 @@ async def _assign_champs(assignments: dict[str, str], db) -> dict[str, str]:
             available = rows  # fallback: allow repeats if pool exhausted
 
         # Weighted random by play rate (higher play rate = more likely to appear)
-        weights = [max(r["play_rate"], 0.001) for r in available]
-        chosen = random.choices(available, weights=weights, k=1)[0]
+        # weights = [max(r["play_rate"], 0.001) for r in available]
+        # chosen = random.choices(available, weights=weights, k=1)[0]
+        chosen = random.choices(available, k=1)[0]
         champ_assignment[did] = chosen["name"]
         used_champs.add(chosen["name"])
 
@@ -114,7 +133,6 @@ async def _assign_champs(assignments: dict[str, str], db) -> dict[str, str]:
 
 def _team_field(team: list, assignments: dict,
                 champ_assignments: dict | None = None) -> str:
-    """Render a team embed field. Optionally includes champion name per player."""
     sorted_team = sort_by_lane(team, assignments)
     lines = []
     for p in sorted_team:
@@ -128,7 +146,6 @@ def _team_field(team: list, assignments: dict,
 
 def _team_field_no_roles(team: list,
                           champ_assignments: dict | None = None) -> str:
-    """Render a team embed field with no roles. Optionally includes champion name."""
     lines = []
     for p in team:
         champ = champ_assignments.get(p["discord_id"], "") if champ_assignments else ""
@@ -181,28 +198,34 @@ async def _move_players_to_channels(
 
 class StartGameView(discord.ui.View):
     """
-    Shown after teams are set. Displays lineup and waits for 'Start Game'.
-    On click: saves DB records, moves players to VCs, swaps to WinnerView.
+    Shown after teams are set. Displays lineup (+ bench if any) and waits for 'Start Game'.
+    On Start Game: saves DB records, moves playing players to VCs, swaps to WinnerView.
+    Bench players are tracked here but receive no stats and are not moved to team VCs.
     """
 
-    def __init__(self, session_id: int, team1: list, team2: list,
+    def __init__(self, session_id: int, team1: list, team2: list, bench: list,
                  team1_assign: dict, team2_assign: dict,
                  team1_champs: dict, team2_champs: dict,
                  assign_roles: bool, random_champs: bool,
-                 settings: dict, game_num: int, all_players: list, cog):
+                 settings: dict, game_num: int,
+                 all_players: list,       # playing 10 (or fewer)
+                 session_players: list,   # full session roster incl. bench
+                 cog):
         super().__init__(timeout=None)
         self.session_id = session_id
         self.team1 = team1
         self.team2 = team2
+        self.bench = bench                       # players not playing this game
         self.team1_assign = team1_assign
         self.team2_assign = team2_assign
-        self.team1_champs = team1_champs   # {discord_id: champ_name} or {}
+        self.team1_champs = team1_champs
         self.team2_champs = team2_champs
         self.assign_roles = assign_roles
         self.random_champs = random_champs
         self.settings = settings
         self.game_num = game_num
-        self.all_players = all_players
+        self.all_players = all_players           # playing only
+        self.session_players = session_players   # everyone (for re-roll / next game)
         self.cog = cog
 
     def build_embed(self, title_suffix: str = "Teams Ready",
@@ -220,9 +243,15 @@ class StartGameView(discord.ui.View):
             embed.add_field(name="🔵 Team 1", value=_team_field_no_roles(self.team1, champs1), inline=True)
             embed.add_field(name="🔴 Team 2", value=_team_field_no_roles(self.team2, champs2), inline=True)
 
+        if self.bench:
+            bench_names = "\n".join(f"• {p['display_name']}" for p in self.bench)
+            embed.add_field(
+                name=f"⏸️ Sitting Out ({len(self.bench)})",
+                value=bench_names,
+                inline=False
+            )
+
         if self.random_champs:
-            patch = None
-            # Try to get patch from any champ data the DB has
             embed.set_footer(text="Champions randomly assigned by play rate")
 
         return embed
@@ -233,13 +262,13 @@ class StartGameView(discord.ui.View):
         guild_id = str(interaction.guild_id)
         db = self.cog.db
 
-        # Save role history
+        # Save role history for playing players only
         if self.assign_roles:
             for did, role in {**self.team1_assign, **self.team2_assign}.items():
                 if role != "Fill":
                     await db.add_role_history(self.session_id, did, guild_id, role)
 
-        # Increment game counter and create game record
+        # Increment game counter and create game record (bench not included)
         await db.increment_session_game(self.session_id)
         session = await db.get_active_session(guild_id)
         actual_game_num = session["game_number"] if session else self.game_num
@@ -250,7 +279,7 @@ class StartGameView(discord.ui.View):
             [p["discord_id"] for p in self.team2]
         )
 
-        # Move players
+        # Move playing players to team VCs (bench stays in lobby)
         t1_ch_id = int(self.settings["team1_channel_id"]) if self.settings.get("team1_channel_id") else None
         t2_ch_id = int(self.settings["team2_channel_id"]) if self.settings.get("team2_channel_id") else None
         lobby_id = int(self.settings["lobby_channel_id"]) if self.settings.get("lobby_channel_id") else None
@@ -258,8 +287,9 @@ class StartGameView(discord.ui.View):
         footer = await _move_players_to_channels(
             interaction.guild, self.team1, self.team2, t1_ch_id, t2_ch_id
         )
+        if self.bench:
+            footer += f" · {len(self.bench)} sitting out"
 
-        # Build in-progress embed (same layout, different header)
         embed = self.build_embed(
             title_suffix=f"#{actual_game_num} — In Progress",
             description="Good luck! Click the winning team when the game ends.",
@@ -272,6 +302,7 @@ class StartGameView(discord.ui.View):
             session_id=self.session_id,
             team1=self.team1,
             team2=self.team2,
+            bench=self.bench,
             team1_ch_id=t1_ch_id,
             team2_ch_id=t2_ch_id,
             lobby_ch_id=lobby_id,
@@ -279,6 +310,7 @@ class StartGameView(discord.ui.View):
             guild=interaction.guild,
             settings=self.settings,
             all_players=self.all_players,
+            session_players=self.session_players,
             cog=self.cog
         )
         await interaction.response.edit_message(embed=embed, view=winner_view)
@@ -287,11 +319,11 @@ class StartGameView(discord.ui.View):
     async def reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
         await interaction.response.defer()
-        team1, team2 = _balance_by_power(self.all_players, use_power=False)
+        # Re-roll from the full session roster so bench rotation changes too
         await self.cog._finalize_teams(
-            interaction, self.session_id, team1, team2, self.settings,
+            interaction, self.session_id, self.session_players, self.settings,
             assign_roles=self.assign_roles, random_champs=self.random_champs,
-            send_mode="message_edit"
+            use_power=False, send_mode="message_edit"
         )
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="✖️", row=0)
@@ -306,24 +338,27 @@ class StartGameView(discord.ui.View):
 
 
 class WinnerView(discord.ui.View):
-    """Buttons for declaring the winning team."""
+    """Buttons for declaring the winning team. Only playing players get stats."""
 
     def __init__(self, game_id: int, session_id: int, team1: list, team2: list,
+                 bench: list,
                  team1_ch_id: Optional[int], team2_ch_id: Optional[int],
                  lobby_ch_id: Optional[int], db, guild: discord.Guild,
-                 settings: dict, all_players: list, cog):
+                 settings: dict, all_players: list, session_players: list, cog):
         super().__init__(timeout=None)
         self.game_id = game_id
         self.session_id = session_id
         self.team1 = team1
         self.team2 = team2
+        self.bench = bench
         self.team1_ch_id = team1_ch_id
         self.team2_ch_id = team2_ch_id
         self.lobby_ch_id = lobby_ch_id
         self.db = db
         self.guild = guild
         self.settings = settings
-        self.all_players = all_players
+        self.all_players = all_players       # playing only
+        self.session_players = session_players  # everyone
         self.cog = cog
 
     async def _record_winner(self, interaction: discord.Interaction, winner: int):
@@ -332,16 +367,19 @@ class WinnerView(discord.ui.View):
         winners = self.team1 if winner == 1 else self.team2
         losers  = self.team2 if winner == 1 else self.team1
 
+        # Only update stats for the players who actually played
         for p in winners:
             await self.db.increment_games(p["discord_id"], p["guild_id"], won=True)
         for p in losers:
             await self.db.increment_games(p["discord_id"], p["guild_id"], won=False)
+        # bench: no stat update
 
+        # Move everyone (playing + bench) back to lobby
         dest_id = self.lobby_ch_id or self.team1_ch_id
         if dest_id:
             dest_ch = self.guild.get_channel(dest_id)
             if dest_ch:
-                for p in self.team1 + self.team2:
+                for p in self.team1 + self.team2 + self.bench:
                     member = self.guild.get_member(int(p["discord_id"]))
                     if member and member.voice:
                         try:
@@ -353,14 +391,17 @@ class WinnerView(discord.ui.View):
         next_view = NextGameView(
             session_id=self.session_id,
             settings=self.settings,
-            players=self.all_players,
+            session_players=self.session_players,  # full roster for re-roll
             team1=self.team1,
             team2=self.team2,
+            bench=self.bench,
             cog=self.cog
         )
+
+        bench_note = f"\n{len(self.bench)} player(s) were sitting out and received no stats." if self.bench else ""
         embed = build_embed(
             f"{win_label} Wins!",
-            "Stats updated. Everyone moved back to lobby.\n\nWhat's next?",
+            f"Stats updated.{bench_note} Everyone moved back to lobby.\n\nWhat's next?",
             "green"
         )
         await interaction.response.edit_message(embed=embed, view=next_view)
@@ -375,16 +416,17 @@ class WinnerView(discord.ui.View):
 
 
 class NextGameView(discord.ui.View):
-    """Buttons shown after a game result is recorded."""
+    """Buttons shown after a game result is recorded. Always re-rolls from the full session roster."""
 
-    def __init__(self, session_id: int, settings: dict, players: list,
-                 team1: list, team2: list, cog):
+    def __init__(self, session_id: int, settings: dict, session_players: list,
+                 team1: list, team2: list, bench: list, cog):
         super().__init__(timeout=None)
         self.session_id = session_id
         self.settings = settings
-        self.all_players = players
+        self.session_players = session_players  # full roster
         self.team1 = team1
         self.team2 = team2
+        self.bench = bench
         self.cog = cog
 
     # Row 0: random team options
@@ -392,29 +434,29 @@ class NextGameView(discord.ui.View):
     async def random_with_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
         await interaction.response.defer()
-        team1, team2 = _balance_by_power(self.all_players, use_power=False)
         await self.cog._finalize_teams(
-            interaction, self.session_id, team1, team2, self.settings,
-            assign_roles=True, random_champs=False, send_mode="followup"
+            interaction, self.session_id, self.session_players, self.settings,
+            assign_roles=True, random_champs=False, use_power=False, send_mode="followup"
         )
 
     @discord.ui.button(label="Random, No Roles", style=discord.ButtonStyle.secondary, emoji="🔀", row=0)
     async def random_no_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
         await interaction.response.defer()
-        team1, team2 = _balance_by_power(self.all_players, use_power=False)
         await self.cog._finalize_teams(
-            interaction, self.session_id, team1, team2, self.settings,
-            assign_roles=False, random_champs=False, send_mode="followup"
+            interaction, self.session_id, self.session_players, self.settings,
+            assign_roles=False, random_champs=False, use_power=False, send_mode="followup"
         )
 
     @discord.ui.button(label="Rematch", style=discord.ButtonStyle.secondary, emoji="🔁", row=0)
     async def rematch(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
         await interaction.response.defer()
+        # Rematch: same 10 players, flip sides — bench stays on bench
         await self.cog._finalize_teams(
-            interaction, self.session_id, self.team2, self.team1, self.settings,
-            assign_roles=True, random_champs=False, send_mode="followup"
+            interaction, self.session_id, self.team2 + self.team1, self.settings,
+            assign_roles=True, random_champs=False, use_power=False, send_mode="followup",
+            force_teams=(self.team2, self.team1)  # explicit sides, no re-split
         )
 
     # Row 1: random champion options
@@ -422,27 +464,25 @@ class NextGameView(discord.ui.View):
     async def random_champs_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
         await interaction.response.defer()
-        team1, team2 = _balance_by_power(self.all_players, use_power=False)
         await self.cog._finalize_teams(
-            interaction, self.session_id, team1, team2, self.settings,
-            assign_roles=True, random_champs=True, send_mode="followup"
+            interaction, self.session_id, self.session_players, self.settings,
+            assign_roles=True, random_champs=True, use_power=False, send_mode="followup"
         )
 
     @discord.ui.button(label="Random Champs, No Roles", style=discord.ButtonStyle.secondary, emoji="🎰", row=1)
     async def random_champs_no_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
         await interaction.response.defer()
-        team1, team2 = _balance_by_power(self.all_players, use_power=False)
         await self.cog._finalize_teams(
-            interaction, self.session_id, team1, team2, self.settings,
-            assign_roles=False, random_champs=True, send_mode="followup"
+            interaction, self.session_id, self.session_players, self.settings,
+            assign_roles=False, random_champs=True, use_power=False, send_mode="followup"
         )
 
     # Row 2: draft
     @discord.ui.button(label="Captain Draft", style=discord.ButtonStyle.success, emoji="🎯", row=2)
     async def captain_draft(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
-        if len(self.all_players) < 3:
+        if len(self.session_players) < 3:
             await interaction.response.send_message("Need at least 3 players for a draft.", ephemeral=True)
             return
         db = self.cog.db
@@ -450,7 +490,7 @@ class NextGameView(discord.ui.View):
         past_captains = await db.get_past_captains(self.session_id, guild_id)
         view = CaptainDraftView(
             session_id=self.session_id,
-            players=self.all_players,
+            players=self.session_players,  # full roster — draft picks its own 10
             db=db,
             guild=interaction.guild,
             settings=self.settings,
@@ -462,7 +502,8 @@ class NextGameView(discord.ui.View):
 
 class CaptainDraftView(discord.ui.View):
     """
-    Snake draft: pick captains (manually or randomly) then alternate picks.
+    Snake draft: captains alternate picking players up to TEAM_SIZE each (10 total).
+    Any remaining unchosen players become the bench.
     Snake order: 1, 2, 2, 1, 1, 2, 2, 1 ...
     """
 
@@ -471,6 +512,7 @@ class CaptainDraftView(discord.ui.View):
                  auto_captains: bool = False):
         super().__init__(timeout=300)
         self.session_id = session_id
+        self.session_players = players  # full roster including potential bench
         self.player_map: dict[str, dict] = {p["discord_id"]: p for p in players}
         self.pool: list[str] = [p["discord_id"] for p in players]
         self.db = db
@@ -499,6 +541,18 @@ class CaptainDraftView(discord.ui.View):
 
         self._build_buttons()
 
+    def _draft_complete(self) -> bool:
+        """Returns True when both teams have TEAM_SIZE players or pool is exhausted."""
+        return (
+            (len(self.team1) >= TEAM_SIZE and len(self.team2) >= TEAM_SIZE)
+            or not self.pool
+        )
+
+    def _active_team_full(self) -> bool:
+        """Returns True if the team whose turn it is already has TEAM_SIZE players."""
+        team = self.team1 if self.turn == 1 else self.team2
+        return len(team) >= TEAM_SIZE
+
     def _player_option(self, did: str) -> discord.SelectOption:
         p = self.player_map[did]
         roles_str = " / ".join(p.get("role_prefs", [])) or "No preference"
@@ -524,17 +578,22 @@ class CaptainDraftView(discord.ui.View):
             )
             sel.callback = self._on_captain_pick
             self.add_item(sel)
-        elif self.phase == "draft" and self.pool:
+        elif self.phase == "draft" and self.pool and not self._draft_complete():
             cap_name = self.player_map[
                 self.captain1_id if self.turn == 1 else self.captain2_id
             ]["display_name"]
+            team_size_now = len(self.team1) if self.turn == 1 else len(self.team2)
             team_label = "🔵 Team 1" if self.turn == 1 else "🔴 Team 2"
             sel = discord.ui.Select(
-                placeholder=f"{team_label} ({cap_name}): pick a player...",
+                placeholder=f"{team_label} ({cap_name}): pick player {team_size_now + 1}/{TEAM_SIZE}...",
                 options=[self._player_option(did) for did in self.pool]
             )
             sel.callback = self._on_draft_pick
             self.add_item(sel)
+
+    def _bench(self) -> list[dict]:
+        """Players left in the pool after draft is complete become the bench."""
+        return [self.player_map[did] for did in self.pool]
 
     def _get_embed(self) -> discord.Embed:
         if self.phase == "pick_captain1":
@@ -553,34 +612,51 @@ class CaptainDraftView(discord.ui.View):
                 lines.append(f"{crown}{p['display_name']} ({roles})")
             return "\n".join(lines)
 
-        pool_lines = [
-            f"• **{self.player_map[did]['display_name']}** — "
-            f"{' / '.join(self.player_map[did].get('role_prefs', [])) or 'No preference'}"
-            for did in self.pool
-        ]
-
         cap1_name = self.player_map[self.captain1_id]["display_name"] if self.captain1_id else "?"
         cap2_name = self.player_map[self.captain2_id]["display_name"] if self.captain2_id else "?"
 
-        if self.pool:
+        draft_done = self._draft_complete()
+
+        if not draft_done:
             turn_cap = cap1_name if self.turn == 1 else cap2_name
             turn_label = "🔵 Team 1" if self.turn == 1 else "🔴 Team 2"
             title = f"Draft — {turn_label} ({turn_cap})'s Pick"
             color = "blue" if self.turn == 1 else "red"
+            pool_lines = [
+                f"• **{self.player_map[did]['display_name']}** — "
+                f"{' / '.join(self.player_map[did].get('role_prefs', [])) or 'No preference'}"
+                for did in self.pool
+            ]
             desc = "**Available:**\n" + "\n".join(pool_lines)
         else:
-            title = "Draft — All Players Picked!"
+            title = "Draft — Complete!"
             color = "green"
-            desc = "All picked!"
+            remaining = self._bench()
+            desc = (
+                f"⏸️ **Sitting out:** {', '.join(p['display_name'] for p in remaining)}"
+                if remaining else "All players picked!"
+            )
 
         embed = build_embed(title, desc, color)
-        embed.add_field(name=f"🔵 Team 1 (cap: {cap1_name})", value=fmt_team(self.team1, self.captain1_id), inline=True)
-        embed.add_field(name=f"🔴 Team 2 (cap: {cap2_name})", value=fmt_team(self.team2, self.captain2_id), inline=True)
+        embed.add_field(
+            name=f"🔵 Team 1 ({len(self.team1)}/{TEAM_SIZE}) — cap: {cap1_name}",
+            value=fmt_team(self.team1, self.captain1_id),
+            inline=True
+        )
+        embed.add_field(
+            name=f"🔴 Team 2 ({len(self.team2)}/{TEAM_SIZE}) — cap: {cap2_name}",
+            value=fmt_team(self.team2, self.captain2_id),
+            inline=True
+        )
         return embed
 
     def _advance_turn(self):
+        """Snake: 1,2,2,1,1,2,2,1,...  Auto-skip if one team is already full."""
         self.snake_pick_index += 1
         self.turn = 1 if (self.snake_pick_index // 2) % 2 == 0 else 2
+        # If the next team is already full, flip to the other one
+        if self._active_team_full():
+            self.turn = 2 if self.turn == 1 else 1
 
     async def _on_captain_pick(self, interaction: discord.Interaction):
         did = interaction.data["values"][0]
@@ -602,7 +678,7 @@ class CaptainDraftView(discord.ui.View):
         self._build_buttons()
         await interaction.response.edit_message(embed=self._get_embed(), view=self)
 
-        if not self.pool:
+        if self._draft_complete():
             await self._finish(interaction)
 
     async def _on_draft_pick(self, interaction: discord.Interaction):
@@ -620,7 +696,7 @@ class CaptainDraftView(discord.ui.View):
         self._advance_turn()
         self._build_buttons()
 
-        if self.pool:
+        if not self._draft_complete():
             await interaction.response.edit_message(embed=self._get_embed(), view=self)
         else:
             self.stop()
@@ -628,6 +704,7 @@ class CaptainDraftView(discord.ui.View):
             await self._finish(interaction)
 
     async def _finish(self, interaction: discord.Interaction):
+        """Draft complete — bench the leftover pool and hand off to _finalize_teams."""
         guild_id = str(interaction.guild_id)
         if self.captain1_id:
             await self.db.add_captain(self.session_id, self.captain1_id, guild_id)
@@ -636,11 +713,13 @@ class CaptainDraftView(discord.ui.View):
 
         team1 = [self.player_map[did] for did in self.team1]
         team2 = [self.player_map[did] for did in self.team2]
+        bench = self._bench()  # whoever wasn't picked
 
         await self.cog._finalize_teams(
-            interaction, self.session_id, team1, team2,
-            self.settings, assign_roles=True, random_champs=False,
-            send_mode="message_edit"
+            interaction, self.session_id, self.session_players, self.settings,
+            assign_roles=True, random_champs=False, use_power=False,
+            send_mode="message_edit",
+            force_teams=(team1, team2, bench)
         )
 
 
@@ -663,12 +742,17 @@ class Teams(commands.Cog):
         return history
 
     async def _finalize_teams(self, interaction: discord.Interaction, session_id: int,
-                               team1: list, team2: list, settings: dict,
+                               session_players: list, settings: dict,
                                assign_roles: bool = True,
                                random_champs: bool = False,
-                               send_mode: str = "send"):
+                               use_power: bool = False,
+                               send_mode: str = "send",
+                               force_teams: tuple = None):
         """
-        Builds the StartGameView and posts it.
+        Splits players into teams + bench, builds StartGameView, posts it.
+
+        force_teams: optional (team1, team2) or (team1, team2, bench) tuple to
+                     skip splitting (used by Rematch and CaptainDraft finish).
 
         send_mode:
           "send"         → interaction.response.send_message
@@ -680,7 +764,16 @@ class Teams(commands.Cog):
         track_roles = bool(session.get("track_roles", 1)) if session else True
         game_num = (session["game_number"] + 1) if session else 1
 
-        # Assign roles (preview only — not saved to DB until Start Game)
+        if force_teams is not None:
+            if len(force_teams) == 3:
+                team1, team2, bench = force_teams
+            else:
+                team1, team2 = force_teams
+                bench = []
+        else:
+            team1, team2, bench = _split_players(session_players, use_power=use_power)
+
+        # Assign roles for playing players only (preview — not saved until Start Game)
         team1_assign: dict = {}
         team2_assign: dict = {}
         if assign_roles:
@@ -691,36 +784,31 @@ class Teams(commands.Cog):
         # Assign random champions if requested
         team1_champs: dict = {}
         team2_champs: dict = {}
+        no_champ_warning = ""
         if random_champs:
             patch = await self.db.get_champion_patch()
             if not patch:
-                # No champion data — warn but continue without champs
                 random_champs = False
                 no_champ_warning = "\n⚠️ No champion data found — run `/update_champs` first."
             else:
-                no_champ_warning = ""
                 if assign_roles:
                     team1_champs = await _assign_champs(team1_assign, self.db)
                     team2_champs = await _assign_champs(team2_assign, self.db)
                 else:
-                    # No roles — assign champs from a random role pool per player
-                    # Give each player a random role just for champ assignment purposes
-                    all_players_combined = team1 + team2
-                    temp_roles = ROLES * ((len(all_players_combined) // len(ROLES)) + 1)
+                    all_playing = team1 + team2
+                    temp_roles = ROLES * ((len(all_playing) // len(ROLES)) + 1)
                     random.shuffle(temp_roles)
-                    temp_assign = {p["discord_id"]: temp_roles[i] for i, p in enumerate(all_players_combined)}
+                    temp_assign = {p["discord_id"]: temp_roles[i] for i, p in enumerate(all_playing)}
                     t1_temp = {p["discord_id"]: temp_assign[p["discord_id"]] for p in team1}
                     t2_temp = {p["discord_id"]: temp_assign[p["discord_id"]] for p in team2}
                     team1_champs = await _assign_champs(t1_temp, self.db)
                     team2_champs = await _assign_champs(t2_temp, self.db)
-        else:
-            no_champ_warning = ""
 
-        all_players = team1 + team2
         start_view = StartGameView(
             session_id=session_id,
             team1=team1,
             team2=team2,
+            bench=bench,
             team1_assign=team1_assign,
             team2_assign=team2_assign,
             team1_champs=team1_champs,
@@ -729,7 +817,8 @@ class Teams(commands.Cog):
             random_champs=random_champs,
             settings=settings,
             game_num=game_num,
-            all_players=all_players,
+            all_players=team1 + team2,
+            session_players=session_players,
             cog=self
         )
         embed = start_view.build_embed()
@@ -745,7 +834,7 @@ class Teams(commands.Cog):
 
     # ── /make_teams ────────────────────────────────────────────────────────────
 
-    @app_commands.command(name="make_teams", description="Randomly split session players into two teams.")
+    @app_commands.command(name="make_teams", description="Split session players into two teams of 5. Extras sit out.")
     @app_commands.describe(
         assign_roles="Assign roles based on player preferences (default: True)",
         random_champs="Randomly assign a champion to each player (default: False)",
@@ -775,18 +864,18 @@ class Teams(commands.Cog):
             )
             return
 
-        team1, team2 = _balance_by_power(players, use_power=use_power)
         await interaction.response.defer()
         await self._finalize_teams(
-            interaction, session["id"], team1, team2, settings,
-            assign_roles=assign_roles, random_champs=random_champs, send_mode="followup"
+            interaction, session["id"], players, settings,
+            assign_roles=assign_roles, random_champs=random_champs,
+            use_power=use_power, send_mode="followup"
         )
 
     # ── /start_draft ──────────────────────────────────────────────────────────
 
     @app_commands.command(
         name="start_draft",
-        description="Start a captain snake draft — captains alternate picking players."
+        description="Captain snake draft. Captains pick up to 5 each; extras sit out."
     )
     @app_commands.describe(
         random_captains="Auto-pick captains, rotating who hasn't been captain yet"
