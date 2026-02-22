@@ -24,13 +24,18 @@ bot.db = None
 
 @bot.event
 async def on_ready():
-    bot.db = await Database.create("lol_bot.db")
+    # Default to the volume path — never falls back to /app which is not persisted
+    db_path = os.getenv("DB_PATH", "/app/data/lol_bot.db")
+    # Ensure the directory exists (safe even if volume isn't mounted)
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    bot.db = await Database.create(db_path)
+    print(f"✅ Logged in as {bot.user} ({bot.user.id})")
+    print(f"📦 Database: {db_path}")
     await bot.load_extension("cogs.players")
     await bot.load_extension("cogs.session")
     await bot.load_extension("cogs.teams")
     await bot.load_extension("cogs.settings")
     await bot.tree.sync()
-    print(f"✅ Logged in as {bot.user} ({bot.user.id})")
 
 
 if __name__ == "__main__":

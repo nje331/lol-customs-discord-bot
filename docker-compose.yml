@@ -6,7 +6,6 @@ services:
     env_file:
       - .env
     volumes:
-      - bot-data:/app/data
-
-volumes:
-  bot-data:
+      # Bind mount: writes directly to ./data/ on your server.
+      # This folder is never touched by "docker compose down" — data is always safe.
+      - ./data:/app/data
