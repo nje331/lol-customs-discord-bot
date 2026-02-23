@@ -18,7 +18,9 @@ intents.members = True
 intents.voice_states = True
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+activity = discord.Game(name="/lol_help")
+
+bot = commands.Bot(command_prefix="!", activity=activity, intents=intents)
 bot.db = None
 
 
