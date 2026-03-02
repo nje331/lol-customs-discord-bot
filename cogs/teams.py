@@ -5,7 +5,7 @@ Handles: random teams, captain draft, role assignment, random champion assignmen
 
 Flow:
   _finalize_teams()  →  shows teams + bench + "Start Game" button  (StartGameView)
-  "Start Game" click →  moves playing 10 to VCs, saves DB records, shows WinnerView
+  "Start Game" click →  moves playing 10 to VCs, saves DB records, shows InProgressView
   winner click       →  saves result for playing 10 only, moves all back, shows NextGameView
   NextGameView       →  re-draft / random / rematch / random-champs (re-rolls from full session roster)
 """
@@ -13,6 +13,7 @@ Flow:
 import discord
 from discord import app_commands
 from discord.ext import commands
+import asyncio
 import random
 from typing import Optional
 
@@ -139,13 +140,17 @@ def _assign_roles(team: list, session_role_history: dict, track_roles: bool,
     return assignment
 
 
-async def _assign_champs(assignments: dict[str, str], db) -> dict[str, str]:
+async def _assign_champs(assignments: dict[str, str], db,
+                         use_weights: bool = False,
+                         exclude: set[str] | None = None) -> dict[str, str]:
     """
     Given {discord_id: role}, returns {discord_id: champion_name}.
-    Picks a random champion weighted by play rate. No champion assigned twice.
+    use_weights: if True, weight picks by play rate; otherwise uniform random.
+    exclude: set of champion names already in use (prevents duplicates across calls).
+    No champion assigned twice within this call.
     """
     champ_assignment: dict[str, str] = {}
-    used_champs: set[str] = set()
+    used_champs: set[str] = set(exclude or [])
 
     for did, role in assignments.items():
         cdr_role = ROLE_TO_CDR.get(role)
@@ -162,13 +167,34 @@ async def _assign_champs(assignments: dict[str, str], db) -> dict[str, str]:
         if not available:
             available = rows  # fallback: allow repeats if pool exhausted
 
-        # weights = [max(r["play_rate"], 0.001) for r in available]
-        # chosen = random.choices(available, weights=weights, k=1)[0]
-        chosen = random.choices(available, k=1)[0]
+        if use_weights:
+            weights = [max(r["play_rate"], 0.001) for r in available]
+            chosen = random.choices(available, weights=weights, k=1)[0]
+        else:
+            chosen = random.choice(available)
+
         champ_assignment[did] = chosen["name"]
         used_champs.add(chosen["name"])
 
     return champ_assignment
+
+
+async def _reroll_one_champ(discord_id: str, role: str, db,
+                             use_weights: bool, exclude: set[str]) -> str:
+    """Pick a single new champion for one player, excluding already-assigned champs."""
+    cdr_role = ROLE_TO_CDR.get(role, "")
+    if not cdr_role:
+        return ""
+    rows = await db.get_champions_for_role(cdr_role, limit=50)
+    if not rows:
+        return ""
+    available = [r for r in rows if r["name"] not in exclude]
+    if not available:
+        available = rows
+    if use_weights:
+        weights = [max(r["play_rate"], 0.001) for r in available]
+        return random.choices(available, weights=weights, k=1)[0]["name"]
+    return random.choice(available)["name"]
 
 
 def _team_field(team: list, assignments: dict,
@@ -245,14 +271,17 @@ async def _move_players_to_channels(
 class StartGameView(discord.ui.View):
     """
     Shown after teams are set. Displays lineup (+ bench if any) and waits for 'Start Game'.
-    On Start Game: saves DB records, moves playing players to VCs, swaps to WinnerView.
-    Bench players are tracked here but receive no stats and are not moved to team VCs.
+    On Start Game: saves DB records, moves playing players to VCs, swaps to InProgressView.
+
+    If champ_rerolls > 0 and random_champs is True, per-player reroll buttons are shown.
+    game_id is None until Start Game is pressed; reroll buttons are disabled until then.
     """
 
     def __init__(self, session_id: int, team1: list, team2: list, bench: list,
                  team1_assign: dict, team2_assign: dict,
                  team1_champs: dict, team2_champs: dict,
                  assign_roles: bool, use_prefs: bool, random_champs: bool,
+                 use_weights: bool,
                  settings: dict, game_num: int,
                  all_players: list,       # playing 10 (or fewer)
                  session_players: list,   # full session roster incl. bench
@@ -261,27 +290,61 @@ class StartGameView(discord.ui.View):
         self.session_id = session_id
         self.team1 = team1
         self.team2 = team2
-        self.bench = bench                       # players not playing this game
+        self.bench = bench
         self.team1_assign = team1_assign
         self.team2_assign = team2_assign
-        self.team1_champs = team1_champs
-        self.team2_champs = team2_champs
+        # Combined champ assignments — mutable so rerolls can update in place
+        self.champ_assignments: dict[str, str] = {**team1_champs, **team2_champs}
         self.assign_roles = assign_roles
         self.use_prefs = use_prefs
         self.random_champs = random_champs
+        self.use_weights = use_weights
         self.settings = settings
         self.game_num = game_num
-        self.all_players = all_players           # playing only
-        self.session_players = session_players   # everyone (for re-roll / next game)
+        self.all_players = all_players
+        self.session_players = session_players
         self.cog = cog
+
+        # Reroll state — populated after Start Game is pressed
+        self.game_id: int | None = None
+        self.champ_rerolls_allowed: int = int(settings.get("champ_rerolls", 0))
+        self._reroll_locks: dict[str, asyncio.Lock] = {}
+        self._rerolls_used: dict[str, int] = {}
+        self._reroll_log: list[dict] = []  # ordered list of reroll events for summary
+        # Per-player set of every champ they've been assigned (initial + all rerolls)
+        # Used to prevent re-rolling back to a champ they already had this game
+        self._rolled_champs: dict[str, set[str]] = {
+            p["discord_id"]: {self.champ_assignments.get(p["discord_id"])}
+            for p in (team1 + team2)
+            if self.champ_assignments.get(p["discord_id"])
+        }
+
+        # Add Reroll Champion button on row 0 (button 2) only when champs are assigned.
+        # Always added when random_champs is True — reroll count is re-checked live at click
+        # time so mid-session setting changes take effect without needing a new make_teams.
+        if random_champs:
+            btn = discord.ui.Button(
+                label="🎲 Reroll Champion",
+                style=discord.ButtonStyle.primary,
+                custom_id="reroll_champ_pre",
+                row=0
+            )
+            async def _reroll_btn_callback(inter: discord.Interaction, b=btn):
+                await self.reroll_champion(inter, b)
+            btn.callback = _reroll_btn_callback
+            self.add_item(btn)
+
+    def _all_assign(self) -> dict[str, str]:
+        """Merge both team role assignments."""
+        return {**self.team1_assign, **self.team2_assign}
 
     def build_embed(self, title_suffix: str = "Teams Ready",
                     description: str = "Review the teams below, then press **Start Game** to begin.",
                     color: str = "blue") -> discord.Embed:
         embed = build_embed(f"Game #{self.game_num} — {title_suffix}", description, color)
 
-        champs1 = self.team1_champs if self.random_champs else None
-        champs2 = self.team2_champs if self.random_champs else None
+        champs1 = {did: self.champ_assignments.get(did, "") for p in self.team1 for did in [p["discord_id"]]} if self.random_champs else None
+        champs2 = {did: self.champ_assignments.get(did, "") for p in self.team2 for did in [p["discord_id"]]} if self.random_champs else None
 
         if self.assign_roles:
             embed.add_field(name="🔵 Team 1", value=_team_field(self.team1, self.team1_assign, champs1), inline=True)
@@ -298,22 +361,130 @@ class StartGameView(discord.ui.View):
                 inline=False
             )
 
+        footer_parts = []
         if self.random_champs:
-            embed.set_footer(text="Champions randomly assigned by role")
+            footer_parts.append("Champions randomly assigned" + (" by play rate" if self.use_weights else ""))
+        if self.game_id and self.random_champs and self.champ_rerolls_allowed > 0:
+            footer_parts.append(f"{self.champ_rerolls_allowed} reroll(s) per player")
+        if footer_parts:
+            embed.set_footer(text=" · ".join(footer_parts))
 
         return embed
 
-    @discord.ui.button(label="Start Game", style=discord.ButtonStyle.success, emoji="▶️", row=0)
+    def _refresh_reroll_button(self):
+        """No-op — kept for compatibility. Reroll button lives in InProgressView after start."""
+        pass
+
+    async def reroll_champion(self, interaction: discord.Interaction, button):
+        """
+        Called by the Reroll Champion button (pre-game) and by InProgressView post-game.
+        Identifies presser via interaction.user.id. Handles locking, DB updates,
+        embed refresh, ephemeral notify, and log accumulation.
+        Always re-fetches guild settings so mid-session changes to reroll count and
+        champ weight take effect immediately.
+        """
+        discord_id = str(interaction.user.id)
+        db = self.cog.db
+
+        player = next((p for p in self.all_players if p["discord_id"] == discord_id), None)
+        if player is None:
+            await interaction.response.send_message(
+                "You are not in this game.", ephemeral=True
+            )
+            return
+
+        if discord_id not in self._reroll_locks:
+            self._reroll_locks[discord_id] = asyncio.Lock()
+        lock = self._reroll_locks[discord_id]
+
+        if lock.locked():
+            await interaction.response.send_message(
+                "Your reroll is already being processed, please wait.", ephemeral=True
+            )
+            return
+
+        async with lock:
+            # Re-fetch settings every time so mid-session changes take effect
+            live_settings = await db.get_settings(str(interaction.guild_id))
+            rerolls_allowed = int(live_settings.get("champ_rerolls", 0))
+            use_weights = bool(live_settings.get("champ_weight_enabled", 0))
+            # Keep stored values in sync so the embed footer stays accurate
+            self.champ_rerolls_allowed = rerolls_allowed
+            self.use_weights = use_weights
+
+            used = await db.get_champ_rerolls_used(self.game_id, discord_id) if self.game_id else self._rerolls_used.get(discord_id, 0)
+            if used >= rerolls_allowed:
+                await interaction.response.send_message(
+                    f"You have no rerolls left (used {used}/{rerolls_allowed}).",
+                    ephemeral=True
+                )
+                return
+
+            all_assign = self._all_assign()
+            role = all_assign.get(discord_id, "")
+            old_champ = self.champ_assignments.get(discord_id, "?")
+
+            # Exclude: all champs currently held by other players + every champ
+            # this player has ever been assigned this game (no repeating their own history)
+            others_champs = {c for did, c in self.champ_assignments.items() if did != discord_id}
+            own_history = self._rolled_champs.get(discord_id, set())
+            exclude = others_champs | own_history
+
+            new_champ = await _reroll_one_champ(discord_id, role, db, use_weights, exclude)
+            if not new_champ:
+                await interaction.response.send_message(
+                    "No champion data available for your role.", ephemeral=True
+                )
+                return
+
+            self.champ_assignments[discord_id] = new_champ
+            # Track this new champ in the player's personal history
+            if discord_id not in self._rolled_champs:
+                self._rolled_champs[discord_id] = set()
+            self._rolled_champs[discord_id].add(new_champ)
+
+            used_after = used + 1
+            self._rerolls_used[discord_id] = used_after
+
+            if self.game_id:
+                await db.increment_champ_reroll(self.game_id, discord_id)
+
+            self._reroll_log.append({
+                "name": player["display_name"],
+                "discord_id": discord_id,
+                "from": old_champ,
+                "to": new_champ,
+                "used_after": used_after,
+            })
+
+            embed = self.build_embed()
+            await interaction.response.defer()
+            await interaction.message.edit(embed=embed)
+
+            remaining = rerolls_allowed - used_after
+            await interaction.followup.send(
+                f"🎲 Rerolled: **{old_champ}** → **{new_champ}** ({remaining} reroll(s) left)",
+                ephemeral=True
+            )
+
+    @discord.ui.button(label="▶️ Start Game", style=discord.ButtonStyle.success, row=0)
     async def start_game(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from utils import check_is_session_owner, check_is_admin
+        is_owner = await check_is_session_owner(interaction)
+        is_admin = await check_is_admin(interaction)
+        if not (is_owner or is_admin):
+            await interaction.response.send_message(
+                "Only the session owner or an admin can start the game.", ephemeral=True
+            )
+            return
         self.stop()
-        # Defer immediately — DB writes + VC moves can take longer than Discord's 3s window
         await interaction.response.defer()
         guild_id = str(interaction.guild_id)
         db = self.cog.db
 
         # Save role history for playing players only
         if self.assign_roles:
-            for did, role in {**self.team1_assign, **self.team2_assign}.items():
+            for did, role in self._all_assign().items():
                 if role != "Fill":
                     await db.add_role_history(self.session_id, did, guild_id, role)
 
@@ -327,6 +498,7 @@ class StartGameView(discord.ui.View):
             [p["discord_id"] for p in self.team1],
             [p["discord_id"] for p in self.team2]
         )
+        self.game_id = game_id
 
         # Move playing players to team VCs (bench stays in lobby)
         t1_ch_id = int(self.settings["team1_channel_id"]) if self.settings.get("team1_channel_id") else None
@@ -340,13 +512,14 @@ class StartGameView(discord.ui.View):
             footer += f" · {len(self.bench)} sitting out"
 
         embed = self.build_embed(
-            title_suffix="In Progress",
+            title_suffix=f"— In Progress",
             description="Good luck! Click the winning team when the game ends.",
             color="gold"
         )
         embed.set_footer(text=footer)
 
-        winner_view = WinnerView(
+        in_progress_view = InProgressView(
+            start_view=self,
             game_id=game_id,
             session_id=self.session_id,
             team1=self.team1,
@@ -356,26 +529,32 @@ class StartGameView(discord.ui.View):
             team2_ch_id=t2_ch_id,
             lobby_ch_id=lobby_id,
             db=db,
-            guild=interaction.guild,
             settings=self.settings,
             all_players=self.all_players,
             session_players=self.session_players,
             cog=self.cog
         )
-        await interaction.message.edit(embed=embed, view=winner_view)
+        await interaction.message.edit(embed=embed, view=in_progress_view)
 
-    @discord.ui.button(label="Re-roll Teams", style=discord.ButtonStyle.secondary, emoji="🎲", row=0)
+    @discord.ui.button(label="🎲 Re-roll Teams", style=discord.ButtonStyle.secondary, row=1)
     async def reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from utils import check_is_session_owner, check_is_admin
+        is_owner = await check_is_session_owner(interaction)
+        is_admin = await check_is_admin(interaction)
+        if not (is_owner or is_admin):
+            await interaction.response.send_message(
+                "Only the session owner or an admin can re-roll teams.", ephemeral=True
+            )
+            return
         self.stop()
         await interaction.response.defer()
-        # Re-roll from the full session roster so bench rotation changes too
         await self.cog._finalize_teams(
             interaction, self.session_id, self.session_players, self.settings,
             assign_roles=self.assign_roles, use_prefs=self.use_prefs,
             random_champs=self.random_champs, use_power=False, send_mode="message_edit"
         )
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="✖️", row=0)
+    @discord.ui.button(label="✖️ Cancel", style=discord.ButtonStyle.danger, row=1)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
         embed = build_embed(
@@ -386,15 +565,20 @@ class StartGameView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=None)
 
 
-class WinnerView(discord.ui.View):
-    """Buttons for declaring the winning team. Only playing players get stats."""
+class InProgressView(discord.ui.View):
+    """
+    Shown after Start Game is pressed. Has winner buttons (row 0) and optionally
+    a Reroll Champion button (row 1) when random_champs + champ_rerolls > 0.
+    Holds a reference to StartGameView for champ assignment state and reroll logic.
+    """
 
-    def __init__(self, game_id: int, session_id: int, team1: list, team2: list,
-                 bench: list,
+    def __init__(self, start_view, game_id: int, session_id: int,
+                 team1: list, team2: list, bench: list,
                  team1_ch_id: Optional[int], team2_ch_id: Optional[int],
-                 lobby_ch_id: Optional[int], db, guild: discord.Guild,
-                 settings: dict, all_players: list, session_players: list, cog):
+                 lobby_ch_id: Optional[int], db, settings: dict,
+                 all_players: list, session_players: list, cog):
         super().__init__(timeout=None)
+        self.start_view = start_view  # StartGameView — owns champ_assignments, locks, etc.
         self.game_id = game_id
         self.session_id = session_id
         self.team1 = team1
@@ -404,12 +588,14 @@ class WinnerView(discord.ui.View):
         self.team2_ch_id = team2_ch_id
         self.lobby_ch_id = lobby_ch_id
         self.db = db
-        # Note: guild is intentionally not stored — we use interaction.guild at click time
-        # to avoid stale cache references after bot restarts
         self.settings = settings
         self.all_players = all_players
         self.session_players = session_players
         self.cog = cog
+
+    async def _reroll_callback(self, interaction: discord.Interaction):
+        """Delegate to StartGameView's reroll logic, which owns all the state."""
+        await self.start_view.reroll_champion(interaction, None)
 
     async def _record_winner(self, interaction: discord.Interaction, winner: int):
         self.stop()
@@ -418,15 +604,11 @@ class WinnerView(discord.ui.View):
         winners = self.team1 if winner == 1 else self.team2
         losers  = self.team2 if winner == 1 else self.team1
 
-        # Only update stats for the players who actually played
         for p in winners:
             await self.db.increment_games(p["discord_id"], p["guild_id"], won=True)
         for p in losers:
             await self.db.increment_games(p["discord_id"], p["guild_id"], won=False)
-        # bench: no stat update
 
-        # Move everyone (playing + bench) back to lobby
-        # Use interaction.guild directly — always valid on a live button click
         guild = interaction.guild
         dest_id = self.lobby_ch_id or self.team1_ch_id
         if dest_id and guild:
@@ -454,7 +636,7 @@ class WinnerView(discord.ui.View):
         next_view = NextGameView(
             session_id=self.session_id,
             settings=self.settings,
-            session_players=self.session_players,  # full roster for re-roll
+            session_players=self.session_players,
             team1=self.team1,
             team2=self.team2,
             bench=self.bench,
@@ -467,13 +649,76 @@ class WinnerView(discord.ui.View):
             f"Stats updated.{bench_note} Everyone moved back to lobby.\n\nWhat's next?",
             "green"
         )
+
+        # Post reroll summary to mod channel last
+        await self._post_reroll_summary(interaction)
+
         await interaction.message.edit(embed=embed, view=next_view)
 
-    @discord.ui.button(label="🔵 Team 1 Won", style=discord.ButtonStyle.primary)
+    async def _post_reroll_summary(self, interaction: discord.Interaction):
+        """Post a per-player reroll summary to the mod channel after the game ends."""
+        sv = self.start_view
+        if not (sv.random_champs and sv.champ_rerolls_allowed > 0):
+            return
+        mod_ch_id = self.settings.get("mod_channel_id")
+        if not mod_ch_id:
+            return
+        try:
+            guild = interaction.guild
+            mod_ch = guild.get_channel(int(mod_ch_id))
+            if mod_ch is None:
+                mod_ch = await guild.fetch_channel(int(mod_ch_id))
+            if not mod_ch:
+                return
+
+            # Build per-player champ chain from the reroll log
+            # Start each player's chain with their original champ (first assignment),
+            # then append each reroll in order.
+            chains: dict[str, list[str]] = {}  # discord_id -> [champ0, champ1, ...]
+            names: dict[str, str] = {}
+
+            # Seed chains with the original assignments
+            for p in self.all_players:
+                did = p["discord_id"]
+                original = sv.champ_assignments.get(did)
+                # Walk the log backwards to reconstruct: final champ is current assignment,
+                # originals are the "from" fields of the first reroll per player.
+                chains[did] = []
+                names[did] = p["display_name"]
+
+            # Replay the log in order to build each chain
+            # First entry "from" is the original champ for that player
+            seen: dict[str, bool] = {}
+            for entry in getattr(sv, "_reroll_log", []):
+                did = entry["discord_id"]
+                if did not in seen:
+                    chains[did].append(entry["from"])
+                    seen[did] = True
+                chains[did].append(entry["to"])
+
+            # Players with no rerolls: chain is just their current (original) champ
+            for p in self.all_players:
+                did = p["discord_id"]
+                if not chains[did]:
+                    chains[did] = [sv.champ_assignments.get(did, "?")]
+
+            lines = [f"📋 **Champion Reroll Summary — Game #{sv.game_num}**"]
+            for p in self.all_players:
+                did = p["discord_id"]
+                used = sv._rerolls_used.get(did, 0)
+                remaining = sv.champ_rerolls_allowed - used
+                chain_str = " → ".join(chains[did])
+                lines.append(f"• **{names[did]}** ({remaining} left): {chain_str}")
+
+            await mod_ch.send("\n".join(lines))
+        except Exception:
+            pass
+
+    @discord.ui.button(label="🔵 Team 1 Won", style=discord.ButtonStyle.primary, row=0)
     async def team1_win(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._record_winner(interaction, 1)
 
-    @discord.ui.button(label="🔴 Team 2 Won", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="🔴 Team 2 Won", style=discord.ButtonStyle.danger, row=0)
     async def team2_win(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._record_winner(interaction, 2)
 
@@ -865,6 +1110,7 @@ class Teams(commands.Cog):
         team1_champs: dict = {}
         team2_champs: dict = {}
         no_champ_warning = ""
+        use_weights = bool(settings.get("champ_weight_enabled", 0))
         if random_champs:
             patch = await self.db.get_champion_patch()
             if not patch:
@@ -872,8 +1118,12 @@ class Teams(commands.Cog):
                 no_champ_warning = "\n⚠️ No champion data found — run `/update_champs` first."
             else:
                 if assign_roles:
-                    team1_champs = await _assign_champs(team1_assign, self.db)
-                    team2_champs = await _assign_champs(team2_assign, self.db)
+                    team1_champs = await _assign_champs(team1_assign, self.db, use_weights=use_weights)
+                    # Pass team1 champs as exclude so team2 can't get the same champ
+                    team2_champs = await _assign_champs(
+                        team2_assign, self.db, use_weights=use_weights,
+                        exclude=set(team1_champs.values())
+                    )
                 else:
                     all_playing = team1 + team2
                     temp_roles = ROLES * ((len(all_playing) // len(ROLES)) + 1)
@@ -881,8 +1131,11 @@ class Teams(commands.Cog):
                     temp_assign = {p["discord_id"]: temp_roles[i] for i, p in enumerate(all_playing)}
                     t1_temp = {p["discord_id"]: temp_assign[p["discord_id"]] for p in team1}
                     t2_temp = {p["discord_id"]: temp_assign[p["discord_id"]] for p in team2}
-                    team1_champs = await _assign_champs(t1_temp, self.db)
-                    team2_champs = await _assign_champs(t2_temp, self.db)
+                    team1_champs = await _assign_champs(t1_temp, self.db, use_weights=use_weights)
+                    team2_champs = await _assign_champs(
+                        t2_temp, self.db, use_weights=use_weights,
+                        exclude=set(team1_champs.values())
+                    )
 
         start_view = StartGameView(
             session_id=session_id,
@@ -896,6 +1149,7 @@ class Teams(commands.Cog):
             assign_roles=assign_roles,
             use_prefs=use_prefs,
             random_champs=random_champs,
+            use_weights=use_weights,
             settings=settings,
             game_num=game_num,
             all_players=team1 + team2,

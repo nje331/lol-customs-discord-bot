@@ -45,7 +45,10 @@ class Database:
                 team1_channel_id    TEXT,
                 team2_channel_id    TEXT,
                 lobby_channel_id    TEXT,
-                use_power_rankings  INTEGER DEFAULT 0
+                mod_channel_id      TEXT,
+                use_power_rankings  INTEGER DEFAULT 0,
+                champ_weight_enabled INTEGER DEFAULT 0,
+                champ_rerolls       INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS sessions (
@@ -96,15 +99,27 @@ class Database:
                 name         TEXT NOT NULL,
                 role         TEXT NOT NULL,   -- TOP, JUNGLE, MIDDLE, BOTTOM, SUPPORT
                 play_rate    REAL DEFAULT 0,
+                win_rate     REAL DEFAULT 0,
+                ban_rate     REAL DEFAULT 0,
                 patch        TEXT NOT NULL,
                 updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (champ_id, role)
+            );
+
+            CREATE TABLE IF NOT EXISTS game_champ_rerolls (
+                game_id      INTEGER NOT NULL,
+                discord_id   TEXT NOT NULL,
+                rerolls_used INTEGER DEFAULT 0,
+                PRIMARY KEY (game_id, discord_id)
             );
         """)
         # Safe migrations for existing databases
         for migration in [
             "ALTER TABLE sessions ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE sessions ADD COLUMN track_roles INTEGER DEFAULT 1",
+            "ALTER TABLE guild_settings ADD COLUMN mod_channel_id TEXT",
+            "ALTER TABLE guild_settings ADD COLUMN champ_weight_enabled INTEGER DEFAULT 0",
+            "ALTER TABLE guild_settings ADD COLUMN champ_rerolls INTEGER DEFAULT 0",
         ]:
             try:
                 await self.db.execute(migration)
@@ -369,7 +384,10 @@ class Database:
                 "team1_channel_id": None,
                 "team2_channel_id": None,
                 "lobby_channel_id": None,
+                "mod_channel_id": None,
                 "use_power_rankings": 0,
+                "champ_weight_enabled": 0,
+                "champ_rerolls": 0,
             }
 
     async def update_setting(self, guild_id: str, key: str, value):
@@ -387,16 +405,19 @@ class Database:
     # ── Champions ────────────────────────────────────────────────────────────
 
     async def upsert_champion(self, champ_id: str, name: str, role: str,
-                               play_rate: float, patch: str):
+                               play_rate: float, win_rate: float, ban_rate: float,
+                               patch: str):
         await self.db.execute("""
-            INSERT INTO champions (champ_id, name, role, play_rate, patch, updated_at)
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO champions (champ_id, name, role, play_rate, win_rate, ban_rate, patch, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(champ_id, role) DO UPDATE SET
                 name       = excluded.name,
                 play_rate  = excluded.play_rate,
+                win_rate   = excluded.win_rate,
+                ban_rate   = excluded.ban_rate,
                 patch      = excluded.patch,
                 updated_at = CURRENT_TIMESTAMP
-        """, (champ_id, name, role, play_rate, patch))
+        """, (champ_id, name, role, play_rate, win_rate, ban_rate, patch))
 
     async def commit(self):
         await self.db.commit()
@@ -429,3 +450,24 @@ class Database:
         ) as cursor:
             row = await cursor.fetchone()
             return row["patch"] if row else None
+
+    # ── Champion Rerolls ─────────────────────────────────────────────────────
+
+    async def get_champ_rerolls_used(self, game_id: int, discord_id: str) -> int:
+        """Return how many champion rerolls this player has used in this game."""
+        async with self.db.execute(
+            "SELECT rerolls_used FROM game_champ_rerolls WHERE game_id=? AND discord_id=?",
+            (game_id, discord_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row["rerolls_used"] if row else 0
+
+    async def increment_champ_reroll(self, game_id: int, discord_id: str):
+        """Increment a player's reroll count for this game by 1."""
+        await self.db.execute("""
+            INSERT INTO game_champ_rerolls (game_id, discord_id, rerolls_used)
+            VALUES (?, ?, 1)
+            ON CONFLICT(game_id, discord_id) DO UPDATE SET
+                rerolls_used = rerolls_used + 1
+        """, (game_id, discord_id))
+        await self.db.commit()
