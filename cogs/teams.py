@@ -716,10 +716,26 @@ class InProgressView(discord.ui.View):
 
     @discord.ui.button(label="🔵 Team 1 Won", style=discord.ButtonStyle.primary, row=0)
     async def team1_win(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from utils import check_is_session_owner, check_is_admin
+        is_owner = await check_is_session_owner(interaction)
+        is_admin = await check_is_admin(interaction)
+        if not (is_owner or is_admin):
+            await interaction.response.send_message(
+                "Only the session owner or an admin can record the winner.", ephemeral=True
+            )
+            return
         await self._record_winner(interaction, 1)
 
     @discord.ui.button(label="🔴 Team 2 Won", style=discord.ButtonStyle.danger, row=0)
     async def team2_win(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from utils import check_is_session_owner, check_is_admin
+        is_owner = await check_is_session_owner(interaction)
+        is_admin = await check_is_admin(interaction)
+        if not (is_owner or is_admin):
+            await interaction.response.send_message(
+                "Only the session owner or an admin can record the winner.", ephemeral=True
+            )
+            return
         await self._record_winner(interaction, 2)
 
 
