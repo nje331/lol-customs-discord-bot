@@ -340,7 +340,7 @@ class StartGameView(discord.ui.View):
             footer += f" · {len(self.bench)} sitting out"
 
         embed = self.build_embed(
-            title_suffix=f"#{actual_game_num} — In Progress",
+            title_suffix="In Progress",
             description="Good luck! Click the winning team when the game ends.",
             color="gold"
         )
