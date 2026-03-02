@@ -11,6 +11,90 @@ from discord.ext import commands
 from utils import ROLE_EMOJIS, build_embed, fmt_player, is_admin, is_session_owner, check_is_admin
 
 
+class CreateGameView(discord.ui.View):
+    """
+    Sub-menu shown when 'Create Game' is pressed on the session control panel.
+    Lets the user pick a team/role setup before launching into the teams flow.
+    """
+
+    def __init__(self, session_id: int, players: list, settings: dict, db, teams_cog):
+        super().__init__(timeout=60)
+        self.session_id = session_id
+        self.players = players
+        self.settings = settings
+        self.db = db
+        self.teams_cog = teams_cog
+
+    def build_embed(self) -> discord.Embed:
+        from utils import build_embed as _be
+        return _be(
+            "Create Game — Choose Format",
+            f"**{len(self.players)} players** in session. Pick a format to generate teams.",
+            "blue"
+        )
+
+    async def _make(self, interaction: discord.Interaction,
+                    assign_roles: bool, use_prefs: bool, random_champs: bool):
+        self.stop()
+        await interaction.response.defer()
+        await self.teams_cog._finalize_teams(
+            interaction, self.session_id, self.players, self.settings,
+            assign_roles=assign_roles, use_prefs=use_prefs,
+            random_champs=random_champs, use_power=False, send_mode="followup"
+        )
+
+    # Row 0 — role assignment options
+    @discord.ui.button(label="Roles (Pref)", style=discord.ButtonStyle.primary, emoji="🎲", row=0)
+    async def roles_pref(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._make(interaction, assign_roles=True, use_prefs=True, random_champs=False)
+
+    @discord.ui.button(label="Roles (Random)", style=discord.ButtonStyle.primary, emoji="🔀", row=0)
+    async def roles_random(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._make(interaction, assign_roles=True, use_prefs=False, random_champs=False)
+
+    @discord.ui.button(label="No Roles", style=discord.ButtonStyle.secondary, emoji="👤", row=0)
+    async def no_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._make(interaction, assign_roles=False, use_prefs=False, random_champs=False)
+
+    # Row 1 — random champs options
+    @discord.ui.button(label="Champs + Roles (Pref)", style=discord.ButtonStyle.primary, emoji="🎰", row=1)
+    async def champs_pref(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._make(interaction, assign_roles=True, use_prefs=True, random_champs=True)
+
+    @discord.ui.button(label="Champs + Roles (Random)", style=discord.ButtonStyle.secondary, emoji="🎰", row=1)
+    async def champs_random(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._make(interaction, assign_roles=True, use_prefs=False, random_champs=True)
+
+    # Row 2 — draft
+    @discord.ui.button(label="Captain Draft", style=discord.ButtonStyle.success, emoji="🎯", row=2)
+    async def captain_draft(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        if len(self.players) < 3:
+            await interaction.response.send_message(
+                "Need at least 3 players for a draft.", ephemeral=True
+            )
+            return
+        from cogs.teams import CaptainDraftView
+        past_captains = await self.db.get_past_captains(self.session_id, str(interaction.guild_id))
+        view = CaptainDraftView(
+            session_id=self.session_id,
+            players=self.players,
+            db=self.db,
+            guild=interaction.guild,
+            settings=self.settings,
+            cog=self.teams_cog,
+            past_captain_ids=past_captains,
+        )
+        await interaction.response.send_message(embed=view._get_embed(), view=view)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="✖️", row=2)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(
+            embed=discord.Embed(description="Cancelled.", colour=0x808080), view=None
+        )
+
+
 class SessionControlView(discord.ui.View):
     """
     Persistent control panel posted when a session starts.
@@ -105,8 +189,8 @@ class SessionControlView(discord.ui.View):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @discord.ui.button(label="Make Teams", style=discord.ButtonStyle.success, emoji="⚔️", row=1)
-    async def make_teams_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Create Game", style=discord.ButtonStyle.success, emoji="⚔️", row=1)
+    async def create_game_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._auth(interaction):
             return
         guild_id = str(interaction.guild_id)
@@ -118,50 +202,23 @@ class SessionControlView(discord.ui.View):
         if len(players) < 2:
             await interaction.response.send_message("Need at least 2 players in the session.", ephemeral=True)
             return
-        settings = await self.cog.db.get_settings(guild_id)
-        teams_cog = interaction.client.cogs.get("Teams")
-        if not teams_cog:
-            await interaction.response.send_message("Teams cog not loaded.", ephemeral=True)
-            return
-        await interaction.response.defer()
-        await teams_cog._finalize_teams(
-            interaction, session["id"], players, settings,
-            assign_roles=True, use_prefs=True, random_champs=False,
-            use_power=False, send_mode="followup"
-        )
 
-    @discord.ui.button(label="Captain Draft", style=discord.ButtonStyle.success, emoji="🎯", row=1)
-    async def captain_draft_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._auth(interaction):
-            return
-        guild_id = str(interaction.guild_id)
-        session = await self.cog.db.get_active_session(guild_id)
-        if not session:
-            await interaction.response.send_message("No active session.", ephemeral=True)
-            return
-        players = await self.cog.db.get_session_players(session["id"], guild_id)
-        if len(players) < 3:
-            await interaction.response.send_message(
-                "Need at least 3 players for a draft (2 captains + 1 to pick).", ephemeral=True
-            )
-            return
         settings = await self.cog.db.get_settings(guild_id)
         teams_cog = interaction.client.cogs.get("Teams")
         if not teams_cog:
             await interaction.response.send_message("Teams cog not loaded.", ephemeral=True)
             return
-        from cogs.teams import CaptainDraftView
-        past_captains = await self.cog.db.get_past_captains(session["id"], guild_id)
-        view = CaptainDraftView(
+
+        view = CreateGameView(
             session_id=session["id"],
             players=players,
-            db=self.cog.db,
-            guild=interaction.guild,
             settings=settings,
-            cog=teams_cog,
-            past_captain_ids=past_captains
+            db=self.cog.db,
+            teams_cog=teams_cog,
         )
-        await interaction.response.send_message(embed=view._get_embed(), view=view)
+        await interaction.response.send_message(
+            embed=view.build_embed(), view=view
+        )
 
     @discord.ui.button(label="End Session", style=discord.ButtonStyle.danger, emoji="🛑", row=1)
     async def end_session_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
