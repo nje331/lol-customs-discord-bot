@@ -252,7 +252,7 @@ class Players(commands.Cog):
             )
 
         embed = build_embed("Leaderboard", "\n".join(lines), "gold")
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ── Admin: /admin_register ────────────────────────────────────────────────
 
