@@ -109,10 +109,59 @@ class SessionControlView(discord.ui.View):
     async def make_teams_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._auth(interaction):
             return
-        await interaction.response.send_message(
-            "Use `/make_teams` to randomly split teams, or `/start_draft` for a captain draft.",
-            ephemeral=True
+        guild_id = str(interaction.guild_id)
+        session = await self.cog.db.get_active_session(guild_id)
+        if not session:
+            await interaction.response.send_message("No active session.", ephemeral=True)
+            return
+        players = await self.cog.db.get_session_players(session["id"], guild_id)
+        if len(players) < 2:
+            await interaction.response.send_message("Need at least 2 players in the session.", ephemeral=True)
+            return
+        settings = await self.cog.db.get_settings(guild_id)
+        teams_cog = interaction.client.cogs.get("Teams")
+        if not teams_cog:
+            await interaction.response.send_message("Teams cog not loaded.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await teams_cog._finalize_teams(
+            interaction, session["id"], players, settings,
+            assign_roles=True, use_prefs=True, random_champs=False,
+            use_power=False, send_mode="followup"
         )
+
+    @discord.ui.button(label="Captain Draft", style=discord.ButtonStyle.success, emoji="🎯", row=1)
+    async def captain_draft_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._auth(interaction):
+            return
+        guild_id = str(interaction.guild_id)
+        session = await self.cog.db.get_active_session(guild_id)
+        if not session:
+            await interaction.response.send_message("No active session.", ephemeral=True)
+            return
+        players = await self.cog.db.get_session_players(session["id"], guild_id)
+        if len(players) < 3:
+            await interaction.response.send_message(
+                "Need at least 3 players for a draft (2 captains + 1 to pick).", ephemeral=True
+            )
+            return
+        settings = await self.cog.db.get_settings(guild_id)
+        teams_cog = interaction.client.cogs.get("Teams")
+        if not teams_cog:
+            await interaction.response.send_message("Teams cog not loaded.", ephemeral=True)
+            return
+        from cogs.teams import CaptainDraftView
+        past_captains = await self.cog.db.get_past_captains(session["id"], guild_id)
+        view = CaptainDraftView(
+            session_id=session["id"],
+            players=players,
+            db=self.cog.db,
+            guild=interaction.guild,
+            settings=settings,
+            cog=teams_cog,
+            past_captain_ids=past_captains
+        )
+        await interaction.response.send_message(embed=view._get_embed(), view=view)
 
     @discord.ui.button(label="End Session", style=discord.ButtonStyle.danger, emoji="🛑", row=1)
     async def end_session_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
