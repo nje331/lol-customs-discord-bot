@@ -66,8 +66,9 @@ class RoleSelectView(discord.ui.View):
             self.add_item(keep_btn)
 
         no_pref_btn = discord.ui.Button(
-            label="No preference / Fill",
-            style=discord.ButtonStyle.secondary
+            label="Clear Preferences",
+            emoji="✖️",
+            style=discord.ButtonStyle.red
         )
         no_pref_btn.callback = self._on_no_pref
         self.add_item(no_pref_btn)

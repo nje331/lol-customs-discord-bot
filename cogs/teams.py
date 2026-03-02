@@ -62,34 +62,79 @@ def _split_players(players: list, use_power: bool) -> tuple[list, list, list]:
     return team1, team2, bench
 
 
-def _assign_roles(team: list, session_role_history: dict, track_roles: bool) -> dict[str, str]:
-    """Returns {discord_id: role}, honouring prefs and optionally avoiding repeated roles."""
+def _assign_roles(team: list, session_role_history: dict, track_roles: bool,
+                  use_prefs: bool = True) -> dict[str, str]:
+    """
+    Returns {discord_id: role}, with two modes:
+
+    use_prefs=True  (default): honour player role preferences, avoid repeats when track_roles.
+      Pass 1: assign each player a fresh preferred role (not played, not taken by teammate).
+              Falls back to any untaken preferred role if all fresh ones are gone.
+      Pass 2: fill remaining players history-aware from leftover roles.
+
+    use_prefs=False (random roles): skip preferences entirely.
+      Single pass: shuffle all roles, assign each player a role they haven't played yet.
+      Falls back to any leftover role only if all 5 have been played this session.
+    """
+    if not use_prefs:
+        # Truly random — no preferences, just history-aware shuffle
+        all_roles = list(ROLES)
+        random.shuffle(all_roles)
+        assignment: dict[str, str] = {}
+        taken_roles: set[str] = set()
+
+        for player in team:
+            played = session_role_history.get(player["discord_id"], []) if track_roles else []
+            available = [r for r in all_roles if r not in taken_roles and r not in played]
+            if not available:
+                # All fresh roles exhausted — fall back to any untaken role
+                available = [r for r in all_roles if r not in taken_roles]
+            if not available:
+                assignment[player["discord_id"]] = "Fill"
+            else:
+                role = available[0]
+                assignment[player["discord_id"]] = role
+                taken_roles.add(role)
+
+        return assignment
+
+    # ── Preference-aware assignment ──────────────────────────────────────────
     assignment: dict[str, str] = {}
     taken_roles: set[str] = set()
     unassigned = list(team)
 
     for player in list(unassigned):
         prefs = player.get("role_prefs", [])
-        if track_roles:
-            played = session_role_history.get(player["discord_id"], [])
-            available_prefs = [r for r in prefs if r not in played]
-            if not available_prefs:
-                available_prefs = prefs
-        else:
-            available_prefs = prefs
+        played = session_role_history.get(player["discord_id"], []) if track_roles else []
 
-        for pref in available_prefs:
-            if pref not in taken_roles:
-                assignment[player["discord_id"]] = pref
-                taken_roles.add(pref)
-                unassigned.remove(player)
-                break
+        # Preferred roles the player hasn't played yet this session
+        fresh_prefs = [r for r in prefs if r not in played and r not in taken_roles]
+        # Fall back to any preferred role if all fresh ones are taken
+        any_prefs = [r for r in prefs if r not in taken_roles]
 
+        candidates = fresh_prefs or any_prefs
+        if candidates:
+            role = candidates[0]
+            assignment[player["discord_id"]] = role
+            taken_roles.add(role)
+            unassigned.remove(player)
+
+    # Fill remaining players — prefer roles they haven't played yet
     remaining_roles = [r for r in ROLES if r not in taken_roles]
     random.shuffle(remaining_roles)
+
     for player in unassigned:
-        role = remaining_roles.pop(0) if remaining_roles else "Fill"
+        if not remaining_roles:
+            assignment[player["discord_id"]] = "Fill"
+            continue
+
+        played = session_role_history.get(player["discord_id"], []) if track_roles else []
+
+        fresh = [r for r in remaining_roles if r not in played]
+        role = fresh[0] if fresh else remaining_roles[0]
+
         assignment[player["discord_id"]] = role
+        remaining_roles.remove(role)
 
     return assignment
 
@@ -97,9 +142,7 @@ def _assign_roles(team: list, session_role_history: dict, track_roles: bool) -> 
 async def _assign_champs(assignments: dict[str, str], db) -> dict[str, str]:
     """
     Given {discord_id: role}, returns {discord_id: champion_name}.
-    Picks a random champion weighted by play rate for each role.
-    If no champion data exists for a role, returns empty string for that player.
-    Ensures no champion is assigned twice in the same game.
+    Picks a random champion weighted by play rate. No champion assigned twice.
     """
     champ_assignment: dict[str, str] = {}
     used_champs: set[str] = set()
@@ -110,18 +153,15 @@ async def _assign_champs(assignments: dict[str, str], db) -> dict[str, str]:
             champ_assignment[did] = ""
             continue
 
-        # Fetch all champions for this role ordered by play rate
         rows = await db.get_champions_for_role(cdr_role, limit=50)
         if not rows:
             champ_assignment[did] = ""
             continue
 
-        # Filter out already-used champs, then weighted-random pick
         available = [r for r in rows if r["name"] not in used_champs]
         if not available:
             available = rows  # fallback: allow repeats if pool exhausted
 
-        # Weighted random by play rate (higher play rate = more likely to appear)
         # weights = [max(r["play_rate"], 0.001) for r in available]
         # chosen = random.choices(available, weights=weights, k=1)[0]
         chosen = random.choices(available, k=1)[0]
@@ -206,7 +246,7 @@ class StartGameView(discord.ui.View):
     def __init__(self, session_id: int, team1: list, team2: list, bench: list,
                  team1_assign: dict, team2_assign: dict,
                  team1_champs: dict, team2_champs: dict,
-                 assign_roles: bool, random_champs: bool,
+                 assign_roles: bool, use_prefs: bool, random_champs: bool,
                  settings: dict, game_num: int,
                  all_players: list,       # playing 10 (or fewer)
                  session_players: list,   # full session roster incl. bench
@@ -221,6 +261,7 @@ class StartGameView(discord.ui.View):
         self.team1_champs = team1_champs
         self.team2_champs = team2_champs
         self.assign_roles = assign_roles
+        self.use_prefs = use_prefs
         self.random_champs = random_champs
         self.settings = settings
         self.game_num = game_num
@@ -259,6 +300,8 @@ class StartGameView(discord.ui.View):
     @discord.ui.button(label="Start Game", style=discord.ButtonStyle.success, emoji="▶️", row=0)
     async def start_game(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
+        # Defer immediately — DB writes + VC moves can take longer than Discord's 3s window
+        await interaction.response.defer()
         guild_id = str(interaction.guild_id)
         db = self.cog.db
 
@@ -313,7 +356,7 @@ class StartGameView(discord.ui.View):
             session_players=self.session_players,
             cog=self.cog
         )
-        await interaction.response.edit_message(embed=embed, view=winner_view)
+        await interaction.message.edit(embed=embed, view=winner_view)
 
     @discord.ui.button(label="Re-roll Teams", style=discord.ButtonStyle.secondary, emoji="🎲", row=0)
     async def reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -322,8 +365,8 @@ class StartGameView(discord.ui.View):
         # Re-roll from the full session roster so bench rotation changes too
         await self.cog._finalize_teams(
             interaction, self.session_id, self.session_players, self.settings,
-            assign_roles=self.assign_roles, random_champs=self.random_champs,
-            use_power=False, send_mode="message_edit"
+            assign_roles=self.assign_roles, use_prefs=self.use_prefs,
+            random_champs=self.random_champs, use_power=False, send_mode="message_edit"
         )
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="✖️", row=0)
@@ -363,6 +406,7 @@ class WinnerView(discord.ui.View):
 
     async def _record_winner(self, interaction: discord.Interaction, winner: int):
         self.stop()
+        await interaction.response.defer()
         await self.db.set_game_winner(self.game_id, winner)
         winners = self.team1 if winner == 1 else self.team2
         losers  = self.team2 if winner == 1 else self.team1
@@ -404,7 +448,7 @@ class WinnerView(discord.ui.View):
             f"Stats updated.{bench_note} Everyone moved back to lobby.\n\nWhat's next?",
             "green"
         )
-        await interaction.response.edit_message(embed=embed, view=next_view)
+        await interaction.message.edit(embed=embed, view=next_view)
 
     @discord.ui.button(label="🔵 Team 1 Won", style=discord.ButtonStyle.primary)
     async def team1_win(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -429,53 +473,67 @@ class NextGameView(discord.ui.View):
         self.bench = bench
         self.cog = cog
 
-    # Row 0: random team options
-    @discord.ui.button(label="Random + Roles", style=discord.ButtonStyle.primary, emoji="🎲", row=0)
+    # Row 0: preference-based role options
+    @discord.ui.button(label="Roles (Pref)", style=discord.ButtonStyle.primary, emoji="🎲", row=0)
     async def random_with_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
         await interaction.response.defer()
         await self.cog._finalize_teams(
             interaction, self.session_id, self.session_players, self.settings,
-            assign_roles=True, random_champs=False, use_power=False, send_mode="followup"
+            assign_roles=True, use_prefs=True, random_champs=False,
+            use_power=False, send_mode="followup"
         )
 
-    @discord.ui.button(label="Random, No Roles", style=discord.ButtonStyle.secondary, emoji="🔀", row=0)
+    @discord.ui.button(label="Roles (Random)", style=discord.ButtonStyle.primary, emoji="🔀", row=0)
+    async def random_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.defer()
+        await self.cog._finalize_teams(
+            interaction, self.session_id, self.session_players, self.settings,
+            assign_roles=True, use_prefs=False, random_champs=False,
+            use_power=False, send_mode="followup"
+        )
+
+    @discord.ui.button(label="No Roles", style=discord.ButtonStyle.secondary, emoji="👤", row=0)
     async def random_no_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
         await interaction.response.defer()
         await self.cog._finalize_teams(
             interaction, self.session_id, self.session_players, self.settings,
-            assign_roles=False, random_champs=False, use_power=False, send_mode="followup"
+            assign_roles=False, use_prefs=True, random_champs=False,
+            use_power=False, send_mode="followup"
         )
 
     @discord.ui.button(label="Rematch", style=discord.ButtonStyle.secondary, emoji="🔁", row=0)
     async def rematch(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
         await interaction.response.defer()
-        # Rematch: same 10 players, flip sides — bench stays on bench
         await self.cog._finalize_teams(
             interaction, self.session_id, self.team2 + self.team1, self.settings,
-            assign_roles=True, random_champs=False, use_power=False, send_mode="followup",
-            force_teams=(self.team2, self.team1)  # explicit sides, no re-split
+            assign_roles=True, use_prefs=True, random_champs=False,
+            use_power=False, send_mode="followup",
+            force_teams=(self.team2, self.team1)
         )
 
     # Row 1: random champion options
-    @discord.ui.button(label="Random Champs + Roles", style=discord.ButtonStyle.primary, emoji="🎰", row=1)
-    async def random_champs_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Champs + Roles (Pref)", style=discord.ButtonStyle.primary, emoji="🎰", row=1)
+    async def random_champs_pref_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
         await interaction.response.defer()
         await self.cog._finalize_teams(
             interaction, self.session_id, self.session_players, self.settings,
-            assign_roles=True, random_champs=True, use_power=False, send_mode="followup"
+            assign_roles=True, use_prefs=True, random_champs=True,
+            use_power=False, send_mode="followup"
         )
 
-    @discord.ui.button(label="Random Champs, No Roles", style=discord.ButtonStyle.secondary, emoji="🎰", row=1)
-    async def random_champs_no_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Champs + Roles (Random)", style=discord.ButtonStyle.secondary, emoji="🎰", row=1)
+    async def random_champs_random_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
         await interaction.response.defer()
         await self.cog._finalize_teams(
             interaction, self.session_id, self.session_players, self.settings,
-            assign_roles=False, random_champs=True, use_power=False, send_mode="followup"
+            assign_roles=True, use_prefs=False, random_champs=True,
+            use_power=False, send_mode="followup"
         )
 
     # Row 2: draft
@@ -490,7 +548,7 @@ class NextGameView(discord.ui.View):
         past_captains = await db.get_past_captains(self.session_id, guild_id)
         view = CaptainDraftView(
             session_id=self.session_id,
-            players=self.session_players,  # full roster — draft picks its own 10
+            players=self.session_players,
             db=db,
             guild=interaction.guild,
             settings=self.settings,
@@ -744,6 +802,7 @@ class Teams(commands.Cog):
     async def _finalize_teams(self, interaction: discord.Interaction, session_id: int,
                                session_players: list, settings: dict,
                                assign_roles: bool = True,
+                               use_prefs: bool = True,
                                random_champs: bool = False,
                                use_power: bool = False,
                                send_mode: str = "send",
@@ -751,6 +810,8 @@ class Teams(commands.Cog):
         """
         Splits players into teams + bench, builds StartGameView, posts it.
 
+        assign_roles: assign lane roles at all (if False, no roles shown)
+        use_prefs:    honour player role preferences (if False, fully random roles but still history-aware)
         force_teams: optional (team1, team2) or (team1, team2, bench) tuple to
                      skip splitting (used by Rematch and CaptainDraft finish).
 
@@ -778,8 +839,8 @@ class Teams(commands.Cog):
         team2_assign: dict = {}
         if assign_roles:
             history = await self._get_role_history(session_id, team1 + team2, guild_id)
-            team1_assign = _assign_roles(team1, history, track_roles)
-            team2_assign = _assign_roles(team2, history, track_roles)
+            team1_assign = _assign_roles(team1, history, track_roles, use_prefs=use_prefs)
+            team2_assign = _assign_roles(team2, history, track_roles, use_prefs=use_prefs)
 
         # Assign random champions if requested
         team1_champs: dict = {}
@@ -814,6 +875,7 @@ class Teams(commands.Cog):
             team1_champs=team1_champs,
             team2_champs=team2_champs,
             assign_roles=assign_roles,
+            use_prefs=use_prefs,
             random_champs=random_champs,
             settings=settings,
             game_num=game_num,
@@ -836,13 +898,15 @@ class Teams(commands.Cog):
 
     @app_commands.command(name="make_teams", description="Split session players into two teams of 5. Extras sit out.")
     @app_commands.describe(
-        assign_roles="Assign roles based on player preferences (default: True)",
+        assign_roles="Assign roles to players (default: True)",
+        random_roles="Ignore role preferences — assign roles randomly but still avoid repeats (default: False)",
         random_champs="Randomly assign a champion to each player (default: False)",
         use_power="Use power rankings to balance teams (default: False)"
     )
     @is_session_owner()
     async def make_teams(self, interaction: discord.Interaction,
                           assign_roles: bool = True,
+                          random_roles: bool = False,
                           random_champs: bool = False,
                           use_power: bool = False):
         guild_id = str(interaction.guild_id)
@@ -867,8 +931,8 @@ class Teams(commands.Cog):
         await interaction.response.defer()
         await self._finalize_teams(
             interaction, session["id"], players, settings,
-            assign_roles=assign_roles, random_champs=random_champs,
-            use_power=use_power, send_mode="followup"
+            assign_roles=assign_roles, use_prefs=not random_roles,
+            random_champs=random_champs, use_power=use_power, send_mode="followup"
         )
 
     # ── /start_draft ──────────────────────────────────────────────────────────
