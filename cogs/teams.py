@@ -213,24 +213,30 @@ async def _move_players_to_channels(
 ) -> str:
     if not (t1_ch_id and t2_ch_id):
         return "Tip: use /configure_channels to enable auto voice splits"
-    t1_ch = guild.get_channel(t1_ch_id)
-    t2_ch = guild.get_channel(t2_ch_id)
+
+    t1_ch = guild.get_channel(t1_ch_id) or await guild.fetch_channel(t1_ch_id)
+    t2_ch = guild.get_channel(t2_ch_id) or await guild.fetch_channel(t2_ch_id)
     if not (t1_ch and t2_ch):
         return "⚠️ Configured voice channels not found"
+
+    async def move(player: dict, channel: discord.VoiceChannel):
+        member = guild.get_member(int(player["discord_id"]))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(player["discord_id"]))
+            except (discord.NotFound, discord.HTTPException):
+                return
+        if member.voice:
+            try:
+                await member.move_to(channel)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
     for p in team1:
-        m = guild.get_member(int(p["discord_id"]))
-        if m and m.voice:
-            try:
-                await m.move_to(t1_ch)
-            except discord.Forbidden:
-                pass
+        await move(p, t1_ch)
     for p in team2:
-        m = guild.get_member(int(p["discord_id"]))
-        if m and m.voice:
-            try:
-                await m.move_to(t2_ch)
-            except discord.Forbidden:
-                pass
+        await move(p, t2_ch)
+
     return f"Players moved → {t1_ch.name} / {t2_ch.name}"
 
 
@@ -398,10 +404,11 @@ class WinnerView(discord.ui.View):
         self.team2_ch_id = team2_ch_id
         self.lobby_ch_id = lobby_ch_id
         self.db = db
-        self.guild = guild
+        # Note: guild is intentionally not stored — we use interaction.guild at click time
+        # to avoid stale cache references after bot restarts
         self.settings = settings
-        self.all_players = all_players       # playing only
-        self.session_players = session_players  # everyone
+        self.all_players = all_players
+        self.session_players = session_players
         self.cog = cog
 
     async def _record_winner(self, interaction: discord.Interaction, winner: int):
@@ -419,16 +426,28 @@ class WinnerView(discord.ui.View):
         # bench: no stat update
 
         # Move everyone (playing + bench) back to lobby
+        # Use interaction.guild directly — always valid on a live button click
+        guild = interaction.guild
         dest_id = self.lobby_ch_id or self.team1_ch_id
-        if dest_id:
-            dest_ch = self.guild.get_channel(dest_id)
+        if dest_id and guild:
+            dest_ch = guild.get_channel(dest_id)
+            if dest_ch is None:
+                try:
+                    dest_ch = await guild.fetch_channel(dest_id)
+                except (discord.NotFound, discord.HTTPException):
+                    dest_ch = None
             if dest_ch:
                 for p in self.team1 + self.team2 + self.bench:
-                    member = self.guild.get_member(int(p["discord_id"]))
-                    if member and member.voice:
+                    member = guild.get_member(int(p["discord_id"]))
+                    if member is None:
+                        try:
+                            member = await guild.fetch_member(int(p["discord_id"]))
+                        except (discord.NotFound, discord.HTTPException):
+                            continue
+                    if member.voice:
                         try:
                             await member.move_to(dest_ch)
-                        except discord.Forbidden:
+                        except (discord.Forbidden, discord.HTTPException):
                             pass
 
         win_label = "🔵 Team 1" if winner == 1 else "🔴 Team 2"
