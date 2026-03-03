@@ -66,9 +66,8 @@ class RoleSelectView(discord.ui.View):
             self.add_item(keep_btn)
 
         no_pref_btn = discord.ui.Button(
-            label="Clear Preferences",
-            emoji="✖️",
-            style=discord.ButtonStyle.red
+            label="No preference / Fill",
+            style=discord.ButtonStyle.secondary
         )
         no_pref_btn.callback = self._on_no_pref
         self.add_item(no_pref_btn)
@@ -327,6 +326,37 @@ class Players(commands.Cog):
             lines.append(f"• {member.display_name if member else f'Unknown ({did})'}")
         embed = build_embed("Bot Admins", "\n".join(lines), "gray")
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+    # ── Admin: /reset_leaderboard ─────────────────────────────────────────────
+
+    @app_commands.command(name="reset_leaderboard", description="[Admin] Reset all players' wins and losses to 0.")
+    @is_admin()
+    async def reset_leaderboard(self, interaction: discord.Interaction):
+        guild_id = str(interaction.guild_id)
+
+        class ConfirmReset(discord.ui.View):
+            def __init__(self_v):
+                super().__init__(timeout=30)
+
+            @discord.ui.button(label="Yes, reset everything", style=discord.ButtonStyle.danger)
+            async def confirm(self_v, btn_inter: discord.Interaction, btn: discord.ui.Button):
+                self_v.stop()
+                await self.db.reset_leaderboard(guild_id)
+                await btn_inter.response.edit_message(
+                    content="✅ All players' wins and losses have been reset to 0.", view=None
+                )
+
+            @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+            async def cancel(self_v, btn_inter: discord.Interaction, btn: discord.ui.Button):
+                self_v.stop()
+                await btn_inter.response.edit_message(content="Cancelled.", view=None)
+
+        await interaction.response.send_message(
+            "⚠️ This will reset **all players'** wins and losses to 0. This cannot be undone.",
+            view=ConfirmReset(),
+            ephemeral=True
+        )
 
 
 async def setup(bot: commands.Bot):

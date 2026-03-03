@@ -370,6 +370,14 @@ class Database:
                 result.append(d)
             return result
 
+    async def reset_leaderboard(self, guild_id: str):
+        """Reset all players' games_played, games_won, and games_lost to 0 for this guild."""
+        await self.db.execute(
+            "UPDATE players SET games_played=0, games_won=0, games_lost=0 WHERE guild_id=?",
+            (guild_id,)
+        )
+        await self.db.commit()
+
     # ── Guild Settings ───────────────────────────────────────────────────────
 
     async def get_settings(self, guild_id: str) -> dict:
