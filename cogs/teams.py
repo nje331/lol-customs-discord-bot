@@ -30,17 +30,101 @@ ROLE_TO_CDR = {
     "Support": "SUPPORT",
 }
 
+# Maps the (assign_roles, use_prefs, random_champs) flags to an ELO type key
+# draft is handled separately
+def _elo_type_for_mode(assign_roles: bool, use_prefs: bool, random_champs: bool) -> str:
+    if not assign_roles:
+        return "no_roles"
+    if use_prefs:
+        return "champs_roles_pref" if random_champs else "roles_pref"
+    return "champs_roles_random" if random_champs else "roles_random"
+
+
+# ── ELO calculation (mirrors elo.py logic) ────────────────────────────────────
+
+def _expected(rating_a: float, rating_b: float) -> float:
+    return 1.0 / (1.0 + 10 ** ((rating_b - rating_a) / 400))
+
+
+def _k_factor(elo: float, games: int) -> float:
+    if elo > 1650:
+        return 20
+    return max(32, 64 - games)
+
+
+def _compute_elo_changes(
+    winners: list[dict], losers: list[dict],
+    elo_type: str, guild_id: str,
+    elo_rows: dict  # (discord_id, elo_type) -> {elo, games, wins, losses}
+) -> dict:
+    """
+    Returns {discord_id: new_elo} for all players.
+    Uses inverse-ELO weighting for winners (lower ELO players gain more)
+    and proportional ELO weighting for losers (higher ELO players lose more),
+    matching the simulation in elo.py.
+    """
+    def get_row(did):
+        return elo_rows.get((did, elo_type), {"elo": 1500.0, "games": 0})
+
+    winner_elos = [get_row(p["discord_id"])["elo"] for p in winners]
+    loser_elos  = [get_row(p["discord_id"])["elo"] for p in losers]
+    avg_winner  = sum(winner_elos) / len(winner_elos)
+    avg_loser   = sum(loser_elos) / len(loser_elos)
+
+    exp_winner = _expected(avg_winner, avg_loser)
+    exp_loser  = 1.0 - exp_winner
+
+    total_loser_elo = sum(loser_elos) or 1.0
+
+    # Winners: distribute gain proportional to inverse ELO (lower elo players gain more)
+    inv_elos = [1.0 / max(e, 1) for e in winner_elos]
+    total_inv = sum(inv_elos) or 1.0
+
+    new_elos: dict[str, float] = {}
+
+    for i, p in enumerate(winners):
+        row = get_row(p["discord_id"])
+        k = _k_factor(row["elo"], row["games"])
+        total_gain = k * (1.0 - exp_winner)
+        share = inv_elos[i] / total_inv
+        new_elos[p["discord_id"]] = row["elo"] + total_gain * share
+
+    for i, p in enumerate(losers):
+        row = get_row(p["discord_id"])
+        k = _k_factor(row["elo"], row["games"])
+        total_loss = k * (0.0 - exp_loser)
+        share = loser_elos[i] / total_loser_elo
+        new_elos[p["discord_id"]] = row["elo"] + total_loss * share
+
+    return new_elos
+
 
 # ── Pure helpers ──────────────────────────────────────────────────────────────
 
-def _split_players(players: list, use_power: bool) -> tuple[list, list, list]:
+def _split_players_random(players: list) -> tuple[list, list, list]:
+    """Pure random split."""
+    pool = players[:]
+    if len(pool) > TEAM_SIZE * 2:
+        random.shuffle(pool)
+        playing = pool[:TEAM_SIZE * 2]
+        bench = pool[TEAM_SIZE * 2:]
+    else:
+        playing = pool
+        bench = []
+    random.shuffle(playing)
+    mid = len(playing) // 2
+    return playing[:mid], playing[mid:], bench
+
+
+def _split_players_balanced_by_elo(
+    players: list, elo_map: dict[str, float]
+) -> tuple[list, list, list]:
     """
-    Split players into (team1, team2, bench).
-    Team size is capped at TEAM_SIZE each (10 playing total).
-    Any extras beyond 10 go to bench, randomly selected.
+    ELO-balanced split: enumerate splits and pick the one with smallest |avg_elo_diff|.
+    For large pools (>10), bench first then balance from the selected 10.
+    Role preference optimization is handled separately in _finalize_teams.
     """
     pool = players[:]
-
     if len(pool) > TEAM_SIZE * 2:
         random.shuffle(pool)
         playing = pool[:TEAM_SIZE * 2]
@@ -49,18 +133,32 @@ def _split_players(players: list, use_power: bool) -> tuple[list, list, list]:
         playing = pool
         bench = []
 
-    # Now split playing 10 into two teams
-    if use_power:
-        playing.sort(key=lambda p: p.get("power_weight", 5.0), reverse=True)
-        team1, team2 = [], []
-        for i, p in enumerate(playing):
-            (team1 if i % 2 == 0 else team2).append(p)
-    else:
-        random.shuffle(playing)
-        mid = len(playing) // 2
-        team1, team2 = playing[:mid], playing[mid:]
+    n = len(playing)
+    if n < 2:
+        return playing, [], bench
 
-    return team1, team2, bench
+    half = n // 2
+
+    # For small n use exhaustive search; for n=10 that's C(10,5)=252 — fast enough
+    from itertools import combinations
+    best_t1, best_t2, best_diff = None, None, float("inf")
+    indices = list(range(n))
+    for combo in combinations(indices, half):
+        t1 = [playing[i] for i in combo]
+        t2 = [playing[i] for i in indices if i not in combo]
+        e1 = sum(elo_map.get(p["discord_id"], 1500.0) for p in t1) / len(t1)
+        e2 = sum(elo_map.get(p["discord_id"], 1500.0) for p in t2) / len(t2)
+        diff = abs(e1 - e2)
+        if diff < best_diff:
+            best_diff = diff
+            best_t1, best_t2 = t1, t2
+
+    return best_t1, best_t2, bench
+
+
+def _split_players(players: list, use_power: bool) -> tuple[list, list, list]:
+    """Legacy signature kept for callers that pass use_power=False (random)."""
+    return _split_players_random(players)
 
 
 def _assign_roles(team: list, session_role_history: dict, track_roles: bool,
@@ -220,13 +318,38 @@ def _team_field_no_roles(team: list,
     return "\n".join(lines)
 
 
+def _pick_one_captain_randomly(players: list, past_captain_ids: list[str]) -> dict:
+    """
+    Pick one captain, prioritising players who have been captain the fewest times.
+    Tracks cycle count so everyone gets an equal number of turns over time.
+    past_captain_ids is a flat ordered list; players who appear fewer times take priority.
+    """
+    from collections import Counter
+    count = Counter(past_captain_ids)
+    min_times = min((count.get(p["discord_id"], 0) for p in players), default=0)
+    least_used = [p for p in players if count.get(p["discord_id"], 0) == min_times]
+    return random.choice(least_used)
+
+
 def _pick_captains_randomly(players: list, past_captain_ids: list[str]) -> tuple[dict, dict]:
-    never_captain = [p for p in players if p["discord_id"] not in past_captain_ids]
-    if len(never_captain) >= 2:
-        picks = random.sample(never_captain, 2)
-    elif len(never_captain) == 1:
-        repeat_pool = [p for p in players if p["discord_id"] != never_captain[0]["discord_id"]]
-        picks = [never_captain[0], random.choice(repeat_pool)]
+    """Pick two distinct captains, both chosen from whoever has been captain the fewest times."""
+    from collections import Counter
+    count = Counter(past_captain_ids)
+    min_times = min((count.get(p["discord_id"], 0) for p in players), default=0)
+    least_used = [p for p in players if count.get(p["discord_id"], 0) == min_times]
+
+    if len(least_used) >= 2:
+        picks = random.sample(least_used, 2)
+    elif len(least_used) == 1:
+        # One spot from least-used, second from next tier
+        cap1 = least_used[0]
+        next_tier_min = min_times + 1
+        next_tier = [p for p in players if count.get(p["discord_id"], 0) == next_tier_min
+                     and p["discord_id"] != cap1["discord_id"]]
+        if not next_tier:
+            next_tier = [p for p in players if p["discord_id"] != cap1["discord_id"]]
+        cap2 = random.choice(next_tier)
+        picks = [cap1, cap2]
     else:
         picks = random.sample(players, 2)
     return picks[0], picks[1]
@@ -285,7 +408,8 @@ class StartGameView(discord.ui.View):
                  settings: dict, game_num: int,
                  all_players: list,       # playing 10 (or fewer)
                  session_players: list,   # full session roster incl. bench
-                 cog):
+                 elo_type: str = "total",
+                 cog=None):
         super().__init__(timeout=None)
         self.session_id = session_id
         self.team1 = team1
@@ -303,7 +427,13 @@ class StartGameView(discord.ui.View):
         self.game_num = game_num
         self.all_players = all_players
         self.session_players = session_players
+        self.elo_type = elo_type
         self.cog = cog
+
+        # Populated by _post_elo_to_mod_channel; used by InProgressView for gain follow-up
+        self.pre_game_elos: dict[str, dict[str, float]] = {}
+        self.elo_breakdown_msg = None   # the discord.Message sent to mod channel
+        self.elo_mod_ch = None          # the mod channel object
 
         # Reroll state — populated after Start Game is pressed
         self.game_id: int | None = None
@@ -536,6 +666,123 @@ class StartGameView(discord.ui.View):
         )
         await interaction.message.edit(embed=embed, view=in_progress_view)
 
+        # Post ELO breakdown to mod channel
+        await self._post_elo_to_mod_channel(interaction, game_id, guild_id, db)
+
+    async def _post_elo_to_mod_channel(self, interaction: discord.Interaction,
+                                        game_id: int, guild_id: str, db):
+        """
+        Post per-player ELO breakdown to the mod channel when a game starts.
+        Shows both Total ELO and mode-specific ELO for each player (with labels).
+        Stores the sent message and pre-game ELO snapshots on self so
+        InProgressView can follow up with ELO gains after the game ends.
+        """
+        mod_ch_id = self.settings.get("mod_channel_id")
+        if not mod_ch_id:
+            return
+        try:
+            guild = interaction.guild
+            mod_ch = guild.get_channel(int(mod_ch_id))
+            if mod_ch is None:
+                mod_ch = await guild.fetch_channel(int(mod_ch_id))
+            if not mod_ch:
+                return
+
+            session = await db.get_active_session(guild_id)
+            auto_balance = session.get("auto_balance", "off") if session else "off"
+
+            from cogs.elo import ELO_TYPE_LABELS
+            mode_label = ELO_TYPE_LABELS.get(self.elo_type, self.elo_type)
+
+            balance_note = {
+                "off":   "⚖️ Auto-balance: **Off** (random split)",
+                "total": "⚖️ Auto-balance: **On — Total ELO**",
+                "mode":  f"⚖️ Auto-balance: **On — Mode ELO** ({mode_label})",
+            }.get(auto_balance, f"⚖️ Auto-balance: {auto_balance}")
+
+            # Fetch both total and mode ELO for every player
+            # pre_elos stores snapshots BEFORE the game for use in the gain message
+            self.pre_game_elos: dict[str, dict[str, float]] = {}  # discord_id -> {elo_type: elo}
+
+            async def fetch_both(player: dict) -> dict:
+                did = player["discord_id"]
+                total_row = await db.get_player_elo(did, guild_id, "total")
+                mode_row  = await db.get_player_elo(did, guild_id, self.elo_type)
+                self.pre_game_elos[did] = {
+                    "total": total_row["elo"],
+                    self.elo_type: mode_row["elo"],
+                }
+                return {
+                    "name":       player["display_name"],
+                    "discord_id": did,
+                    "total":      total_row["elo"],
+                    "mode":       mode_row["elo"],
+                }
+
+            t1_data = [await fetch_both(p) for p in self.team1]
+            t2_data = [await fetch_both(p) for p in self.team2]
+
+            def avg(data, key): return sum(d[key] for d in data) / len(data) if data else 0
+
+            t1_total_avg = avg(t1_data, "total")
+            t2_total_avg = avg(t2_data, "total")
+            t1_mode_avg  = avg(t1_data, "mode")
+            t2_mode_avg  = avg(t2_data, "mode")
+
+            same_type = self.elo_type == "total"
+
+            def player_line(d: dict) -> str:
+                if same_type:
+                    return f"  {d['name']}: **{d['total']:.0f}** (Total ELO)"
+                return (
+                    f"  {d['name']}: **{d['total']:.0f}** Total"
+                    f" | **{d['mode']:.0f}** Mode"
+                )
+
+            def team_block(data):
+                return "\n".join(player_line(d) for d in data)
+
+            if same_type:
+                t1_avg_str = f"avg **{t1_total_avg:.0f}** Total ELO"
+                t2_avg_str = f"avg **{t2_total_avg:.0f}** Total ELO"
+                diff_str   = f"Total ELO diff: **{abs(t1_total_avg - t2_total_avg):.0f}**"
+            else:
+                t1_avg_str = (
+                    f"avg **{t1_total_avg:.0f}** Total"
+                    f" | avg **{t1_mode_avg:.0f}** Mode"
+                )
+                t2_avg_str = (
+                    f"avg **{t2_total_avg:.0f}** Total"
+                    f" | avg **{t2_mode_avg:.0f}** Mode"
+                )
+                diff_str = (
+                    f"Total ELO diff: **{abs(t1_total_avg - t2_total_avg):.0f}**"
+                    f" | Mode ELO diff: **{abs(t1_mode_avg - t2_mode_avg):.0f}**"
+                )
+
+            if not same_type:
+                type_footer = (
+                    f"\n_Total = across all modes  |  Mode = {mode_label}_"
+                )
+            else:
+                type_footer = ""
+
+            msg = (
+                f"📊 **ELO Breakdown — Game #{self.game_num}**\n"
+                f"{balance_note}\n\n"
+                f"🔵 **Team 1** — {t1_avg_str}\n"
+                f"{team_block(t1_data)}\n\n"
+                f"🔴 **Team 2** — {t2_avg_str}\n"
+                f"{team_block(t2_data)}\n\n"
+                f"{diff_str}{type_footer}"
+            )
+            sent = await mod_ch.send(msg)
+            # Stash for the post-game ELO gain follow-up
+            self.elo_breakdown_msg = sent
+            self.elo_mod_ch = mod_ch
+        except Exception:
+            pass  # Never block the game from starting
+
     @discord.ui.button(label="🎲 Re-roll Teams", style=discord.ButtonStyle.secondary, row=1)
     async def reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
         from utils import check_is_session_owner, check_is_admin
@@ -739,6 +986,93 @@ class InProgressView(discord.ui.View):
         """Delegate to StartGameView's reroll logic, which owns all the state."""
         await self.start_view.reroll_champion(interaction, None)
 
+    async def _update_elos(self, winners: list, losers: list, guild_id: str):
+        """Compute and persist ELO changes for both the mode-specific and total ELO."""
+        all_players = winners + losers
+        elo_type = self.start_view.elo_type
+
+        # Fetch all needed ELO rows in bulk
+        elo_rows: dict = {}
+        for p in all_players:
+            did = p["discord_id"]
+            for et in (elo_type, "total"):
+                if (did, et) not in elo_rows:
+                    elo_rows[(did, et)] = await self.db.get_player_elo(did, guild_id, et)
+
+        # Calculate and save for mode-specific ELO and total ELO
+        for et in (elo_type, "total") if elo_type != "total" else ("total",):
+            new_elos = _compute_elo_changes(winners, losers, et, guild_id, elo_rows)
+            winner_ids = {p["discord_id"] for p in winners}
+            for p in all_players:
+                did = p["discord_id"]
+                new_e = new_elos.get(did, elo_rows[(did, et)]["elo"])
+                won = did in winner_ids
+                await self.db.update_player_elo(did, guild_id, et, new_e, won)
+                await self.db.record_elo_history(did, guild_id, et, new_e, self.game_id)
+
+    async def _post_elo_gains(self, interaction: discord.Interaction,
+                               winners: list, losers: list, guild_id: str):
+        """
+        Send a follow-up message to the mod channel (as a reply to the breakdown message
+        if available) showing each player's ELO change after the game.
+        """
+        sv = self.start_view
+        mod_ch = sv.elo_mod_ch
+        if not mod_ch:
+            return
+        try:
+            from cogs.elo import ELO_TYPE_LABELS
+            elo_type = sv.elo_type
+            mode_label = ELO_TYPE_LABELS.get(elo_type, elo_type)
+            same_type = elo_type == "total"
+
+            winner_ids = {p["discord_id"] for p in winners}
+            all_players = winners + losers
+
+            lines = ["📈 **ELO Gains / Losses**\n"]
+            for p in all_players:
+                did = p["discord_id"]
+                pre = sv.pre_game_elos.get(did, {})
+
+                total_row = await self.db.get_player_elo(did, guild_id, "total")
+                mode_row  = await self.db.get_player_elo(did, guild_id, elo_type)
+
+                new_total = total_row["elo"]
+                new_mode  = mode_row["elo"]
+                old_total = pre.get("total", new_total)
+                old_mode  = pre.get(elo_type, new_mode)
+
+                delta_total = new_total - old_total
+                delta_mode  = new_mode  - old_mode
+
+                won = did in winner_ids
+                result_icon = "✅" if won else "❌"
+
+                def fmt_delta(d: float) -> str:
+                    sign = "+" if d >= 0 else ""
+                    return f"{sign}{d:.1f}"
+
+                if same_type:
+                    lines.append(
+                        f"{result_icon} **{p['display_name']}**: "
+                        f"{old_total:.0f} → **{new_total:.0f}** "
+                        f"({fmt_delta(delta_total)} Total ELO)"
+                    )
+                else:
+                    lines.append(
+                        f"{result_icon} **{p['display_name']}**: "
+                        f"Total {old_total:.0f}→**{new_total:.0f}** ({fmt_delta(delta_total)})"
+                        f" | Mode {old_mode:.0f}→**{new_mode:.0f}** ({fmt_delta(delta_mode)})"
+                    )
+
+            msg_text = "\n".join(lines)
+            if sv.elo_breakdown_msg:
+                await sv.elo_breakdown_msg.reply(msg_text)
+            else:
+                await mod_ch.send(msg_text)
+        except Exception:
+            pass
+
     async def _record_winner(self, interaction: discord.Interaction, winner: int):
         self.stop()
         await interaction.response.defer()
@@ -750,6 +1084,12 @@ class InProgressView(discord.ui.View):
             await self.db.increment_games(p["discord_id"], p["guild_id"], won=True)
         for p in losers:
             await self.db.increment_games(p["discord_id"], p["guild_id"], won=False)
+
+        # ── ELO update ────────────────────────────────────────────────────────
+        await self._update_elos(winners, losers, str(interaction.guild_id))
+
+        # ── ELO gain follow-up to mod channel ─────────────────────────────────
+        await self._post_elo_gains(interaction, winners, losers, str(interaction.guild_id))
 
         guild = interaction.guild
         dest_id = self.lobby_ch_id or self.team1_ch_id
@@ -1034,54 +1374,59 @@ class CaptainDraftView(discord.ui.View):
     """
     Snake draft: captains alternate picking players up to TEAM_SIZE each (10 total).
     Any remaining unchosen players become the bench.
-    Snake order: 1, 2, 2, 1, 1, 2, 2, 1 ...
+    Snake order: T1 picks 1st, T2 picks 2nd & 3rd, T1 picks 4th & 5th, etc.
+
+    Auth rules:
+      - Captain selection: session owner or bot admin only
+      - Draft picks: the active captain, session owner, or bot admin
     """
 
     def __init__(self, session_id: int, players: list, db, guild: discord.Guild,
-                 settings: dict, cog, past_captain_ids: list[str] = None,
-                 auto_captains: bool = False):
-        super().__init__(timeout=300)
+                 settings: dict, cog, past_captain_ids: list[str] = None):
+        super().__init__(timeout=600)  # 10 min — deferred interactions extend this
         self.session_id = session_id
-        self.session_players = players  # full roster including potential bench
+        self.session_players = players
         self.player_map: dict[str, dict] = {p["discord_id"]: p for p in players}
         self.pool: list[str] = [p["discord_id"] for p in players]
         self.db = db
         self.guild = guild
         self.settings = settings
         self.cog = cog
-        self.past_captain_ids = past_captain_ids or []
+        self.past_captain_ids: list[str] = list(past_captain_ids or [])
         self.team1: list[str] = []
         self.team2: list[str] = []
         self.captain1_id: str = None
         self.captain2_id: str = None
+        # Snake order: T1 picks 1st, T2 picks 2nd & 3rd, T1 picks 4th & 5th,
+        # T2 picks 6th & 7th, T1 picks 8th.  SNAKE[idx] gives the active team.
+        # snake_pick_index starts at 0 (T1's first pick after captains set).
         self.snake_pick_index: int = 0
-        self.turn = 1
-
-        if auto_captains:
-            self.phase = "draft"
-            cap1, cap2 = _pick_captains_randomly(players, self.past_captain_ids)
-            self.captain1_id = cap1["discord_id"]
-            self.captain2_id = cap2["discord_id"]
-            self.team1.append(self.captain1_id)
-            self.team2.append(self.captain2_id)
-            self.pool.remove(self.captain1_id)
-            self.pool.remove(self.captain2_id)
-        else:
-            self.phase = "pick_captain1"
+        self.turn: int = 1
+        self.phase: str = "pick_captain1"
 
         self._build_buttons()
 
-    def _draft_complete(self) -> bool:
-        """Returns True when both teams have TEAM_SIZE players or pool is exhausted."""
-        return (
-            (len(self.team1) >= TEAM_SIZE and len(self.team2) >= TEAM_SIZE)
-            or not self.pool
-        )
+    # ── Auth helpers ─────────────────────────────────────────────────────────
 
-    def _active_team_full(self) -> bool:
-        """Returns True if the team whose turn it is already has TEAM_SIZE players."""
-        team = self.team1 if self.turn == 1 else self.team2
-        return len(team) >= TEAM_SIZE
+    async def _is_admin_or_owner(self, interaction: discord.Interaction) -> bool:
+        from utils import check_is_session_owner
+        return await check_is_session_owner(interaction)
+
+    async def _is_active_captain_or_admin(self, interaction: discord.Interaction) -> bool:
+        """During draft phase, the active captain, any admin, or session owner may pick."""
+        if await self._is_admin_or_owner(interaction):
+            return True
+        active_cap_id = self.captain1_id if self.turn == 1 else self.captain2_id
+        return str(interaction.user.id) == active_cap_id
+
+    # ── Shared edit helper ───────────────────────────────────────────────────
+
+    async def _edit(self, interaction: discord.Interaction):
+        """Deferred edit so we get maximum response time."""
+        await interaction.response.defer()
+        await interaction.message.edit(embed=self._get_embed(), view=self)
+
+    # ── UI construction ──────────────────────────────────────────────────────
 
     def _player_option(self, did: str) -> discord.SelectOption:
         p = self.player_map[did]
@@ -1094,42 +1439,54 @@ class CaptainDraftView(discord.ui.View):
 
     def _build_buttons(self):
         self.clear_items()
-        if self.phase == "pick_captain1":
-            sel = discord.ui.Select(
-                placeholder="Pick Team 1 Captain...",
-                options=[self._player_option(did) for did in self.pool]
-            )
+
+        if self.phase in ("pick_captain1", "pick_captain2"):
+            placeholder = ("Pick Team 1 Captain..." if self.phase == "pick_captain1"
+                           else "Pick Team 2 Captain...")
+            sel = discord.ui.Select(placeholder=placeholder,
+                                    options=[self._player_option(did) for did in self.pool])
             sel.callback = self._on_captain_pick
             self.add_item(sel)
-        elif self.phase == "pick_captain2":
-            sel = discord.ui.Select(
-                placeholder="Pick Team 2 Captain...",
-                options=[self._player_option(did) for did in self.pool]
+
+            # Random captain button
+            rnd_btn = discord.ui.Button(
+                label="🎲 Random Captain",
+                style=discord.ButtonStyle.secondary,
+                row=1
             )
-            sel.callback = self._on_captain_pick
-            self.add_item(sel)
+            rnd_btn.callback = self._on_random_captain
+            self.add_item(rnd_btn)
+
         elif self.phase == "draft" and self.pool and not self._draft_complete():
-            cap_name = self.player_map[
-                self.captain1_id if self.turn == 1 else self.captain2_id
-            ]["display_name"]
+            cap_id = self.captain1_id if self.turn == 1 else self.captain2_id
+            cap_name = self.player_map[cap_id]["display_name"]
             team_size_now = len(self.team1) if self.turn == 1 else len(self.team2)
             team_label = "🔵 Team 1" if self.turn == 1 else "🔴 Team 2"
             sel = discord.ui.Select(
-                placeholder=f"{team_label} ({cap_name}): pick player {team_size_now + 1}/{TEAM_SIZE}...",
+                placeholder=f"{team_label} ({cap_name}): pick #{team_size_now + 1}/{TEAM_SIZE}...",
                 options=[self._player_option(did) for did in self.pool]
             )
             sel.callback = self._on_draft_pick
             self.add_item(sel)
 
-    def _bench(self) -> list[dict]:
-        """Players left in the pool after draft is complete become the bench."""
-        return [self.player_map[did] for did in self.pool]
+    # ── Embed ────────────────────────────────────────────────────────────────
 
     def _get_embed(self) -> discord.Embed:
         if self.phase == "pick_captain1":
-            return build_embed("Draft — Pick Team 1 Captain", "Select a player to captain Team 1.", "blue")
+            return build_embed(
+                "Draft — Pick Team 1 Captain",
+                "An admin or session owner can select or randomise the captain.\n"
+                "Use the dropdown or the **🎲 Random Captain** button.",
+                "blue"
+            )
         if self.phase == "pick_captain2":
-            return build_embed("Draft — Pick Team 2 Captain", "Select a player to captain Team 2.", "red")
+            cap1_name = self.player_map[self.captain1_id]["display_name"]
+            return build_embed(
+                "Draft — Pick Team 2 Captain",
+                f"👑 **{cap1_name}** captains Team 1.\n"
+                "Now pick or randomise Team 2's captain.",
+                "red"
+            )
 
         def fmt_team(ids: list[str], captain_id: str) -> str:
             if not ids:
@@ -1144,7 +1501,6 @@ class CaptainDraftView(discord.ui.View):
 
         cap1_name = self.player_map[self.captain1_id]["display_name"] if self.captain1_id else "?"
         cap2_name = self.player_map[self.captain2_id]["display_name"] if self.captain2_id else "?"
-
         draft_done = self._draft_complete()
 
         if not draft_done:
@@ -1157,7 +1513,10 @@ class CaptainDraftView(discord.ui.View):
                 f"{' / '.join(self.player_map[did].get('role_prefs', [])) or 'No preference'}"
                 for did in self.pool
             ]
-            desc = "**Available:**\n" + "\n".join(pool_lines)
+            desc = (
+                f"_{turn_cap} or an admin/owner may pick._\n\n"
+                "**Available:**\n" + "\n".join(pool_lines)
+            )
         else:
             title = "Draft — Complete!"
             color = "green"
@@ -1180,19 +1539,63 @@ class CaptainDraftView(discord.ui.View):
         )
         return embed
 
+    # ── Turn logic ───────────────────────────────────────────────────────────
+
+    def _draft_complete(self) -> bool:
+        return (
+            (len(self.team1) >= TEAM_SIZE and len(self.team2) >= TEAM_SIZE)
+            or not self.pool
+        )
+
+    def _active_team_full(self) -> bool:
+        team = self.team1 if self.turn == 1 else self.team2
+        return len(team) >= TEAM_SIZE
+
     def _advance_turn(self):
-        """Snake: 1,2,2,1,1,2,2,1,...  Auto-skip if one team is already full."""
+        """
+        Desired snake: T1, T2, T2, T1, T1, T2, T2, T1
+        (idx 0→T1, 1→T2, 2→T2, 3→T1, 4→T1, 5→T2, 6→T2, 7→T1)
+        Pattern repeats every 4 picks after the first: [T1, T2, T2, T1] x2
+        Implemented as a lookup table; auto-skip if the next team is already full.
+        """
+        SNAKE = [1, 2, 2, 1, 1, 2, 2, 1]  # 8 picks covers a full 5v5 draft
         self.snake_pick_index += 1
-        self.turn = 1 if (self.snake_pick_index // 2) % 2 == 0 else 2
-        # If the next team is already full, flip to the other one
+        idx = min(self.snake_pick_index, len(SNAKE) - 1)
+        self.turn = SNAKE[idx]
+        # If the assigned team is already full, give the pick to the other team
         if self._active_team_full():
             self.turn = 2 if self.turn == 1 else 1
 
+    def _bench(self) -> list[dict]:
+        return [self.player_map[did] for did in self.pool]
+
+    # ── Callbacks ────────────────────────────────────────────────────────────
+
+    async def _on_random_captain(self, interaction: discord.Interaction):
+        if not await self._is_admin_or_owner(interaction):
+            await interaction.response.send_message(
+                "❌ Only the session owner or an admin can randomise captains.", ephemeral=True
+            )
+            return
+
+        pool_players = [self.player_map[did] for did in self.pool]
+        cap = _pick_one_captain_randomly(pool_players, self.past_captain_ids)
+        await self._assign_captain(interaction, cap["discord_id"])
+
     async def _on_captain_pick(self, interaction: discord.Interaction):
+        if not await self._is_admin_or_owner(interaction):
+            await interaction.response.send_message(
+                "❌ Only the session owner or an admin can select captains.", ephemeral=True
+            )
+            return
         did = interaction.data["values"][0]
         if did not in self.pool:
             await interaction.response.send_message("That player was already picked.", ephemeral=True)
             return
+        await self._assign_captain(interaction, did)
+
+    async def _assign_captain(self, interaction: discord.Interaction, did: str):
+        """Common path for both manual and random captain assignment."""
         self.pool.remove(did)
 
         if self.phase == "pick_captain1":
@@ -1203,15 +1606,29 @@ class CaptainDraftView(discord.ui.View):
             self.captain2_id = did
             self.team2.append(did)
             self.phase = "draft"
-            self.turn = 1
+            self.turn = 1  # T1 always picks first after captains chosen
+            self.snake_pick_index = 0
 
         self._build_buttons()
-        await interaction.response.edit_message(embed=self._get_embed(), view=self)
 
         if self._draft_complete():
+            await interaction.response.defer()
+            await interaction.message.edit(embed=self._get_embed(), view=None)
             await self._finish(interaction)
+            return
+
+        await self._edit(interaction)
 
     async def _on_draft_pick(self, interaction: discord.Interaction):
+        if not await self._is_active_captain_or_admin(interaction):
+            active_cap_id = self.captain1_id if self.turn == 1 else self.captain2_id
+            cap_name = self.player_map[active_cap_id]["display_name"]
+            await interaction.response.send_message(
+                f"❌ It's **{cap_name}**'s pick. Only they, the session owner, or an admin can pick.",
+                ephemeral=True
+            )
+            return
+
         did = interaction.data["values"][0]
         if did not in self.pool:
             await interaction.response.send_message("That player was already picked.", ephemeral=True)
@@ -1227,10 +1644,11 @@ class CaptainDraftView(discord.ui.View):
         self._build_buttons()
 
         if not self._draft_complete():
-            await interaction.response.edit_message(embed=self._get_embed(), view=self)
+            await self._edit(interaction)
         else:
             self.stop()
-            await interaction.response.edit_message(embed=self._get_embed(), view=None)
+            await interaction.response.defer()
+            await interaction.message.edit(embed=self._get_embed(), view=None)
             await self._finish(interaction)
 
     async def _finish(self, interaction: discord.Interaction):
@@ -1243,13 +1661,14 @@ class CaptainDraftView(discord.ui.View):
 
         team1 = [self.player_map[did] for did in self.team1]
         team2 = [self.player_map[did] for did in self.team2]
-        bench = self._bench()  # whoever wasn't picked
+        bench = self._bench()
 
         await self.cog._finalize_teams(
             interaction, self.session_id, self.session_players, self.settings,
             assign_roles=True, random_champs=False, use_power=False,
             send_mode="message_edit",
-            force_teams=(team1, team2, bench)
+            force_teams=(team1, team2, bench),
+            override_elo_type="draft"
         )
 
 
@@ -1278,7 +1697,8 @@ class Teams(commands.Cog):
                                random_champs: bool = False,
                                use_power: bool = False,
                                send_mode: str = "send",
-                               force_teams: tuple = None):
+                               force_teams: tuple = None,
+                               override_elo_type: str = None):
         """
         Splits players into teams + bench, builds StartGameView, posts it.
 
@@ -1294,7 +1714,10 @@ class Teams(commands.Cog):
         """
         guild_id = str(interaction.guild_id)
         session = await self.db.get_active_session(guild_id)
-        track_roles = bool(session.get("track_roles", 1)) if session else True
+        repeat_roles = bool(session.get("repeat_roles", 0)) if session else False
+        # track_roles is the inverse of repeat_roles
+        track_roles = not repeat_roles
+        auto_balance = session.get("auto_balance", "off") if session else "off"
         game_num = (session["game_number"] + 1) if session else 1
 
         if force_teams is not None:
@@ -1304,7 +1727,18 @@ class Teams(commands.Cog):
                 team1, team2 = force_teams
                 bench = []
         else:
-            team1, team2, bench = _split_players(session_players, use_power=use_power)
+            # Determine ELO type for this mode
+            elo_type_key = _elo_type_for_mode(assign_roles, use_prefs, random_champs)
+
+            if auto_balance in ("total", "mode"):
+                fetch_type = "total" if auto_balance == "total" else elo_type_key
+                elo_map: dict[str, float] = {}
+                for p in session_players:
+                    row = await self.db.get_player_elo(p["discord_id"], guild_id, fetch_type)
+                    elo_map[p["discord_id"]] = row["elo"]
+                team1, team2, bench = _split_players_balanced_by_elo(session_players, elo_map)
+            else:
+                team1, team2, bench = _split_players_random(session_players)
 
         # Assign roles for playing players only (preview — not saved until Start Game)
         team1_assign: dict = {}
@@ -1345,6 +1779,9 @@ class Teams(commands.Cog):
                         exclude=set(team1_champs.values())
                     )
 
+        # Resolve the ELO type for this game (stored on the view for use when recording results)
+        elo_type_key = override_elo_type or _elo_type_for_mode(assign_roles, use_prefs, random_champs)
+
         start_view = StartGameView(
             session_id=session_id,
             team1=team1,
@@ -1362,6 +1799,7 @@ class Teams(commands.Cog):
             game_num=game_num,
             all_players=team1 + team2,
             session_players=session_players,
+            elo_type=elo_type_key,
             cog=self
         )
         embed = start_view.build_embed()
@@ -1382,14 +1820,12 @@ class Teams(commands.Cog):
         assign_roles="Assign roles to players (default: True)",
         random_roles="Ignore role preferences — assign roles randomly but still avoid repeats (default: False)",
         random_champs="Randomly assign a champion to each player (default: False)",
-        use_power="Use power rankings to balance teams (default: False)"
     )
     @is_session_owner()
     async def make_teams(self, interaction: discord.Interaction,
                           assign_roles: bool = True,
                           random_roles: bool = False,
-                          random_champs: bool = False,
-                          use_power: bool = False):
+                          random_champs: bool = False):
         guild_id = str(interaction.guild_id)
         session = await self.db.get_active_session(guild_id)
         if not session:
@@ -1403,17 +1839,11 @@ class Teams(commands.Cog):
 
         settings = await self.db.get_settings(guild_id)
 
-        if use_power and not settings.get("use_power_rankings"):
-            await interaction.response.send_message(
-                "Power rankings are disabled. Enable with `/toggle_setting`.", ephemeral=True
-            )
-            return
-
         await interaction.response.defer()
         await self._finalize_teams(
             interaction, session["id"], players, settings,
             assign_roles=assign_roles, use_prefs=not random_roles,
-            random_champs=random_champs, use_power=use_power, send_mode="followup"
+            random_champs=random_champs, use_power=False, send_mode="followup"
         )
 
     # ── /start_draft ──────────────────────────────────────────────────────────
@@ -1422,11 +1852,8 @@ class Teams(commands.Cog):
         name="start_draft",
         description="Captain snake draft. Captains pick up to 5 each; extras sit out."
     )
-    @app_commands.describe(
-        random_captains="Auto-pick captains, rotating who hasn't been captain yet"
-    )
     @is_session_owner()
-    async def start_draft(self, interaction: discord.Interaction, random_captains: bool = False):
+    async def start_draft(self, interaction: discord.Interaction):
         guild_id = str(interaction.guild_id)
         session = await self.db.get_active_session(guild_id)
         if not session:
@@ -1451,21 +1878,8 @@ class Teams(commands.Cog):
             settings=settings,
             cog=self,
             past_captain_ids=past_captains,
-            auto_captains=random_captains
         )
-
-        if random_captains:
-            cap1_name = view.player_map[view.captain1_id]["display_name"]
-            cap2_name = view.player_map[view.captain2_id]["display_name"]
-            embed = view._get_embed()
-            embed.description = (
-                f"👑 **{cap1_name}** captains Team 1\n"
-                f"👑 **{cap2_name}** captains Team 2\n\n"
-                + (embed.description or "")
-            )
-            await interaction.response.send_message(embed=embed, view=view)
-        else:
-            await interaction.response.send_message(embed=view._get_embed(), view=view)
+        await interaction.response.send_message(embed=view._get_embed(), view=view)
 
 
 async def setup(bot: commands.Bot):

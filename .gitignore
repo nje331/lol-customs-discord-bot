@@ -2,5 +2,5 @@
 __pycache__/
 TODO.txt
 *.ipynb
-elo.py
-lol_bot.db
+z_kevin_elo.py
+*.db

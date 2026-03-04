@@ -8,7 +8,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from utils import ROLE_EMOJIS, build_embed, fmt_player, is_admin, is_session_owner, check_is_admin
+from utils import ROLE_EMOJIS, build_embed, fmt_player, is_admin, is_session_owner, check_is_admin, check_is_session_owner
 
 
 class CreateGameView(discord.ui.View):
@@ -153,7 +153,7 @@ class SessionControlView(discord.ui.View):
                 if not p:
                     await self.cog.db.upsert_player(str(member.id), guild_id, member.display_name, [])
                     auto_reg.append(member.display_name)
-                await self.cog.db.add_session_player(session["id"], str(member.id), guild_id)
+                await self.cog.db.add_session_player(session["id"], str(member.id), guild_id, member.display_name)
                 added.append(member.display_name)
             players = await self.cog.db.get_session_players(session["id"], guild_id)
             desc = f"Added **{len(added)}** from **{vc.name}**."
@@ -270,9 +270,17 @@ class Session(commands.Cog):
 
     @app_commands.command(name="start_session", description="Start a new custom game session.")
     @app_commands.describe(
-        track_roles="Avoid giving the same role twice in one session (default: ON)"
+        repeat_roles="Allow players to get the same role multiple times in one session (default: OFF)",
+        auto_balance="Auto-balance teams by ELO: 'off', 'total', or 'mode' (default: off)"
     )
-    async def start_session(self, interaction: discord.Interaction, track_roles: bool = True):
+    @app_commands.choices(auto_balance=[
+        app_commands.Choice(name="Off — random teams", value="off"),
+        app_commands.Choice(name="Total ELO — balance by overall ELO", value="total"),
+        app_commands.Choice(name="Mode ELO — balance by the draft mode's ELO", value="mode"),
+    ])
+    async def start_session(self, interaction: discord.Interaction,
+                             repeat_roles: bool = False,
+                             auto_balance: str = "off"):
         guild_id = str(interaction.guild_id)
         existing = await self.db.get_active_session(guild_id)
 
@@ -286,9 +294,9 @@ class Session(commands.Cog):
                     self_v.stop()
                     gid = str(btn_inter.guild_id)
                     await self.db.end_session(existing["id"])
-                    sid = await self.db.create_session(gid, str(btn_inter.user.id), track_roles)
+                    sid = await self.db.create_session(gid, str(btn_inter.user.id), repeat_roles, auto_balance)
                     view = SessionControlView(sid, gid, self)
-                    embed = self._session_started_embed(sid, btn_inter.user, track_roles)
+                    embed = self._session_started_embed(sid, btn_inter.user, repeat_roles, auto_balance)
                     await btn_inter.response.edit_message(content=None, embed=embed, view=view)
 
                 @discord.ui.button(label="Keep current session", style=discord.ButtonStyle.secondary)
@@ -302,22 +310,24 @@ class Session(commands.Cog):
             )
             return
 
-        sid = await self.db.create_session(guild_id, str(interaction.user.id), track_roles)
+        sid = await self.db.create_session(guild_id, str(interaction.user.id), repeat_roles, auto_balance)
         view = SessionControlView(sid, guild_id, self)
-        embed = self._session_started_embed(sid, interaction.user, track_roles)
+        embed = self._session_started_embed(sid, interaction.user, repeat_roles, auto_balance)
         await interaction.response.send_message(embed=embed, view=view)
 
-    def _session_started_embed(self, sid: int, user: discord.User, track_roles: bool) -> discord.Embed:
-        track_note = (
-            "✅ **Role tracking ON** — players won't get the same role twice this session.\n"
-            "Start a new session with `track_roles: False` to disable."
-            if track_roles else
-            "❌ **Role tracking OFF** — roles will be assigned freely."
+    def _session_started_embed(self, sid: int, user: discord.User,
+                                 repeat_roles: bool, auto_balance: str) -> discord.Embed:
+        repeat_note = (
+            "✅ **Repeat roles ON** — players may receive the same role multiple times."
+            if repeat_roles else
+            "❌ **Repeat roles OFF** — players won't get the same role twice this session."
         )
+        balance_labels = {"off": "❌ Off (random)", "total": "✅ Total ELO", "mode": "✅ Mode ELO"}
+        balance_note = f"⚖️ **Auto-balance:** {balance_labels.get(auto_balance, auto_balance)}"
         return build_embed(
             "Session Started!",
             f"Session **#{sid}** — started by {user.mention}\n\n"
-            f"{track_note}\n\n"
+            f"{repeat_note}\n{balance_note}\n\n"
             "Use the buttons below or slash commands to manage the session.",
             "green"
         )
@@ -381,7 +391,7 @@ class Session(commands.Cog):
             if not player:
                 await self.db.upsert_player(str(member.id), guild_id, member.display_name, [])
                 auto_registered.append(member.display_name)
-            await self.db.add_session_player(session["id"], str(member.id), guild_id)
+            await self.db.add_session_player(session["id"], str(member.id), guild_id, member.display_name)
             added.append(member.display_name)
 
         players = await self.db.get_session_players(session["id"], guild_id)
@@ -428,7 +438,7 @@ class Session(commands.Cog):
             if not player:
                 await self.db.upsert_player(str(member.id), guild_id, member.display_name, [])
                 auto_reg.append(member.display_name)
-            await self.db.add_session_player(session["id"], str(member.id), guild_id)
+            await self.db.add_session_player(session["id"], str(member.id), guild_id, member.display_name)
             added.append(member.display_name)
 
         if not added:
@@ -513,6 +523,67 @@ class Session(commands.Cog):
         await interaction.response.send_message(
             "Remove all players from the session roster?",
             view=ConfirmView(), ephemeral=True
+        )
+
+
+    # ── /session_settings ─────────────────────────────────────────────────────
+
+    @app_commands.command(name="session_settings", description="View or change settings for the active session.")
+    @app_commands.describe(
+        repeat_roles="Allow players to receive the same role more than once this session",
+        auto_balance="Auto-balance team splits by ELO"
+    )
+    @app_commands.choices(auto_balance=[
+        app_commands.Choice(name="Off — random teams", value="off"),
+        app_commands.Choice(name="Total ELO — balance by overall ELO", value="total"),
+        app_commands.Choice(name="Mode ELO — balance by the draft mode's ELO", value="mode"),
+    ])
+    @is_session_owner()
+    async def session_settings(self, interaction: discord.Interaction,
+                                 repeat_roles: bool = None,
+                                 auto_balance: str = None):
+        guild_id = str(interaction.guild_id)
+        session = await self.db.get_active_session(guild_id)
+        if not session:
+            await interaction.response.send_message("No active session.", ephemeral=True)
+            return
+
+        # No params → show current settings
+        if repeat_roles is None and auto_balance is None:
+            balance_labels = {"off": "❌ Off (random)", "total": "✅ Total ELO", "mode": "✅ Mode ELO"}
+            current_balance = session.get("auto_balance", "off")
+            current_repeat = bool(session.get("repeat_roles", 0))
+            embed = build_embed("Current Session Settings", color_key="blue")
+            embed.add_field(
+                name="Repeat Roles",
+                value="✅ ON — players may receive the same role multiple times"
+                      if current_repeat else
+                      "❌ OFF — players won't get the same role twice this session",
+                inline=False
+            )
+            embed.add_field(
+                name="Auto-Balance",
+                value=balance_labels.get(current_balance, current_balance),
+                inline=False
+            )
+            embed.set_footer(text=f"Session #{session['id']} · Use /session_settings with a parameter to change.")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        updates = {}
+        lines = []
+        if repeat_roles is not None:
+            updates["repeat_roles"] = 1 if repeat_roles else 0
+            lines.append(f"Repeat roles: {'✅ ON' if repeat_roles else '❌ OFF'}")
+        if auto_balance is not None:
+            updates["auto_balance"] = auto_balance
+            labels = {"off": "❌ Off (random)", "total": "✅ Total ELO", "mode": "✅ Mode ELO"}
+            lines.append(f"Auto-balance: {labels.get(auto_balance, auto_balance)}")
+
+        await self.db.update_session(session["id"], **updates)
+        await interaction.response.send_message(
+            "✅ Session settings updated:\n" + "\n".join(f"• {l}" for l in lines),
+            ephemeral=True
         )
 
 

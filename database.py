@@ -59,7 +59,9 @@ class Database:
                 ended_at         DATETIME,
                 is_active        INTEGER DEFAULT 1,
                 game_number      INTEGER DEFAULT 0,
-                track_roles      INTEGER DEFAULT 1
+                track_roles      INTEGER DEFAULT 1,
+                repeat_roles     INTEGER DEFAULT 0,
+                auto_balance     TEXT DEFAULT 'off'
             );
 
             CREATE TABLE IF NOT EXISTS session_players (
@@ -111,6 +113,31 @@ class Database:
                 PRIMARY KEY (game_id, discord_id)
             );
 
+            -- ELO ratings per player per guild, one row per elo_type
+            -- elo_type: 'total' | 'roles_pref' | 'roles_random' | 'no_roles'
+            --           | 'champs_roles_pref' | 'champs_roles_random' | 'draft'
+            CREATE TABLE IF NOT EXISTS player_elo (
+                discord_id   TEXT NOT NULL,
+                guild_id     TEXT NOT NULL,
+                elo_type     TEXT NOT NULL,
+                elo          REAL DEFAULT 1500.0,
+                wins         INTEGER DEFAULT 0,
+                losses       INTEGER DEFAULT 0,
+                games        INTEGER DEFAULT 0,
+                PRIMARY KEY (discord_id, guild_id, elo_type)
+            );
+
+            -- Full ELO history: one row per game per player per elo_type
+            CREATE TABLE IF NOT EXISTS elo_history (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                discord_id   TEXT NOT NULL,
+                guild_id     TEXT NOT NULL,
+                elo_type     TEXT NOT NULL,
+                elo_after    REAL NOT NULL,
+                game_id      INTEGER NOT NULL,
+                recorded_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+
             -- Aggregated peer ratings received by each player
             CREATE TABLE IF NOT EXISTS player_ratings (
                 discord_id        TEXT NOT NULL,
@@ -135,6 +162,8 @@ class Database:
         for migration in [
             "ALTER TABLE sessions ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE sessions ADD COLUMN track_roles INTEGER DEFAULT 1",
+            "ALTER TABLE sessions ADD COLUMN repeat_roles INTEGER DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN auto_balance TEXT DEFAULT 'off'",
             "ALTER TABLE guild_settings ADD COLUMN mod_channel_id TEXT",
             "ALTER TABLE guild_settings ADD COLUMN champ_weight_enabled INTEGER DEFAULT 0",
             "ALTER TABLE guild_settings ADD COLUMN champ_rerolls INTEGER DEFAULT 0",
@@ -257,10 +286,11 @@ class Database:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
-    async def create_session(self, guild_id: str, owner_id: str, track_roles: bool = True) -> int:
+    async def create_session(self, guild_id: str, owner_id: str, repeat_roles: bool = False,
+                              auto_balance: str = "off") -> int:
         cursor = await self.db.execute(
-            "INSERT INTO sessions (guild_id, owner_id, track_roles) VALUES (?, ?, ?)",
-            (guild_id, owner_id, 1 if track_roles else 0)
+            "INSERT INTO sessions (guild_id, owner_id, track_roles, repeat_roles, auto_balance) VALUES (?, ?, 1, ?, ?)",
+            (guild_id, owner_id, 1 if repeat_roles else 0, auto_balance)
         )
         await self.db.commit()
         return cursor.lastrowid
@@ -272,6 +302,15 @@ class Database:
         )
         await self.db.commit()
 
+    async def update_session(self, session_id: int, **kwargs):
+        """Update arbitrary session columns. kwargs keys must be valid column names."""
+        for key, value in kwargs.items():
+            await self.db.execute(
+                f"UPDATE sessions SET {key}=? WHERE id=?",
+                (value, session_id)
+            )
+        await self.db.commit()
+
     async def increment_session_game(self, session_id: int):
         await self.db.execute(
             "UPDATE sessions SET game_number=game_number+1 WHERE id=?",
@@ -281,11 +320,17 @@ class Database:
 
     # ── Session Players ──────────────────────────────────────────────────────
 
-    async def add_session_player(self, session_id: int, discord_id: str, guild_id: str):
+    async def add_session_player(self, session_id: int, discord_id: str, guild_id: str,
+                                  display_name: str = None):
         await self.db.execute(
             "INSERT OR IGNORE INTO session_players VALUES (?, ?, ?)",
             (session_id, discord_id, guild_id)
         )
+        if display_name:
+            await self.db.execute(
+                "UPDATE players SET display_name=? WHERE discord_id=? AND guild_id=?",
+                (display_name, discord_id, guild_id)
+            )
         await self.db.commit()
 
     async def remove_session_player(self, session_id: int, discord_id: str, guild_id: str):
@@ -577,3 +622,66 @@ class Database:
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
+
+    # ── ELO ──────────────────────────────────────────────────────────────────
+
+    async def get_player_elo(self, discord_id: str, guild_id: str, elo_type: str) -> dict:
+        """Return ELO row for a player/guild/type, creating a default if absent."""
+        async with self.db.execute(
+            "SELECT * FROM player_elo WHERE discord_id=? AND guild_id=? AND elo_type=?",
+            (discord_id, guild_id, elo_type)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return dict(row)
+            return {"discord_id": discord_id, "guild_id": guild_id, "elo_type": elo_type,
+                    "elo": 1500.0, "wins": 0, "losses": 0, "games": 0}
+
+    async def get_all_elos(self, guild_id: str) -> list[dict]:
+        """Return all ELO rows for a guild."""
+        async with self.db.execute(
+            "SELECT * FROM player_elo WHERE guild_id=? ORDER BY elo_type, elo DESC",
+            (guild_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    async def update_player_elo(self, discord_id: str, guild_id: str, elo_type: str,
+                                  new_elo: float, won: bool):
+        """Upsert an ELO value and increment win/loss/games counters."""
+        w_col = "wins" if won else "losses"
+        await self.db.execute(f"""
+            INSERT INTO player_elo (discord_id, guild_id, elo_type, elo, {w_col}, games)
+            VALUES (?, ?, ?, ?, 1, 1)
+            ON CONFLICT(discord_id, guild_id, elo_type) DO UPDATE SET
+                elo    = excluded.elo,
+                {w_col} = {w_col} + 1,
+                games  = games + 1
+        """, (discord_id, guild_id, elo_type, new_elo))
+        await self.db.commit()
+
+    async def record_elo_history(self, discord_id: str, guild_id: str, elo_type: str,
+                                   elo_after: float, game_id: int):
+        """Append one ELO history entry."""
+        await self.db.execute(
+            "INSERT INTO elo_history (discord_id, guild_id, elo_type, elo_after, game_id) VALUES (?,?,?,?,?)",
+            (discord_id, guild_id, elo_type, elo_after, game_id)
+        )
+        await self.db.commit()
+
+    async def get_elo_history(self, guild_id: str, discord_id: str = None,
+                               elo_type: str = "total") -> list[dict]:
+        """Return ELO history rows ordered by game_id. Optionally filter by player."""
+        if discord_id:
+            async with self.db.execute(
+                "SELECT * FROM elo_history WHERE guild_id=? AND discord_id=? AND elo_type=? ORDER BY game_id ASC",
+                (guild_id, discord_id, elo_type)
+            ) as cursor:
+                rows = await cursor.fetchall()
+        else:
+            async with self.db.execute(
+                "SELECT * FROM elo_history WHERE guild_id=? AND elo_type=? ORDER BY game_id ASC",
+                (guild_id, elo_type)
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(r) for r in rows]

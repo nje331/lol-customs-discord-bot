@@ -329,11 +329,11 @@ class Players(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-    # ── Admin: /reset_leaderboard ─────────────────────────────────────────────
+    # ── Admin: /reset_stats ────────────────────────────────────────────
 
-    @app_commands.command(name="reset_leaderboard", description="[Admin] Reset all players' wins and losses to 0.")
+    @app_commands.command(name="reset_stats", description="[Admin] Reset all players' stats, ELOs, and ELO history for this server.")
     @is_admin()
-    async def reset_leaderboard(self, interaction: discord.Interaction):
+    async def reset_stats(self, interaction: discord.Interaction):
         guild_id = str(interaction.guild_id)
 
         class ConfirmReset(discord.ui.View):
@@ -345,7 +345,7 @@ class Players(commands.Cog):
                 self_v.stop()
                 await self.db.reset_leaderboard(guild_id)
                 await btn_inter.response.edit_message(
-                    content="✅ All players' wins and losses have been reset to 0.", view=None
+                    content="✅ All players' wins, losses, ELOs (reset to 1500), and ELO history have been wiped.", view=None
                 )
 
             @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -354,7 +354,7 @@ class Players(commands.Cog):
                 await btn_inter.response.edit_message(content="Cancelled.", view=None)
 
         await interaction.response.send_message(
-            "⚠️ This will reset **all players'** wins and losses to 0. This cannot be undone.",
+            "⚠️ This will reset **all players'** wins, losses, ELOs (back to 1500), and wipe all ELO history. **This cannot be undone.**",
             view=ConfirmReset(),
             ephemeral=True
         )

@@ -38,6 +38,7 @@ async def on_ready():
     await bot.load_extension("cogs.teams")
     await bot.load_extension("cogs.settings")
     await bot.load_extension("cogs.champions")
+    await bot.load_extension("cogs.elo")
     await bot.tree.sync()
 
 
