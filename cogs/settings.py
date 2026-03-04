@@ -118,7 +118,8 @@ class Settings(commands.Cog):
                 f"Power Rankings: {'✅ ON' if s.get('use_power_rankings') else '❌ OFF'}\n"
                 f"Champ Weight (play rate): {'✅ ON' if s.get('champ_weight_enabled') else '❌ OFF'}\n"
                 f"Champ Rerolls per game: **{s.get('champ_rerolls', 0)}** "
-                f"({'disabled' if not s.get('champ_rerolls') else 'per player'})"
+                f"({'disabled' if not s.get('champ_rerolls') else 'per player'})\n"
+                f"Peer Ratings (post-game DM): {'✅ ON' if s.get('peer_ratings_enabled') else '❌ OFF'}"
             ),
             inline=False
         )
@@ -147,6 +148,7 @@ class Settings(commands.Cog):
     @app_commands.choices(setting=[
         app_commands.Choice(name="Power Rankings (balance teams by skill weight)", value="use_power_rankings"),
         app_commands.Choice(name="Champion Weight (use play rate for random champ picks)", value="champ_weight_enabled"),
+        app_commands.Choice(name="Peer Ratings (send post-game rating DMs to players)", value="peer_ratings_enabled"),
     ])
     @is_admin()
     async def toggle_setting(self, interaction: discord.Interaction, setting: str):
@@ -158,6 +160,7 @@ class Settings(commands.Cog):
         labels = {
             "use_power_rankings": "Power Rankings",
             "champ_weight_enabled": "Champion Weight (play rate)",
+            "peer_ratings_enabled": "Peer Ratings (post-game DM)",
         }
         await interaction.response.send_message(
             f"**{labels.get(setting, setting)}** is now {state}.", ephemeral=True
@@ -176,6 +179,79 @@ class Settings(commands.Cog):
         else:
             msg = f"✅ Champion rerolls set to **{count}** per player per game."
         await interaction.response.send_message(msg, ephemeral=True)
+
+    # ── /view_ratings ──────────────────────────────────────────────────────────
+
+    @app_commands.command(name="view_ratings", description="[Admin] View peer rating scores and engagement metrics for all players.")
+    @is_admin()
+    async def view_ratings(self, interaction: discord.Interaction):
+        guild_id = str(interaction.guild_id)
+        ratings   = await self.db.get_all_ratings(guild_id)
+        engagement = await self.db.get_all_engagement(guild_id)
+
+        # Index for quick lookup
+        eng_map = {e["discord_id"]: e for e in engagement}
+
+        # Gather all player names
+        all_ids = set(r["discord_id"] for r in ratings) | set(e["discord_id"] for e in engagement)
+        player_names: dict[str, str] = {}
+        for did in all_ids:
+            p = await self.db.get_player(did, guild_id)
+            if p:
+                player_names[did] = p["display_name"]
+            else:
+                member = interaction.guild.get_member(int(did))
+                player_names[did] = member.display_name if member else f"<@{did}>"
+
+        # Also get games_played for each player
+        games_map: dict[str, int] = {}
+        for did in all_ids:
+            p = await self.db.get_player(did, guild_id)
+            games_map[did] = p["games_played"] if p else 0
+
+        embed = build_embed("Peer Ratings & Engagement", color_key="gold")
+
+        # ── Received ratings ──────────────────────────────────────────────────
+        if ratings:
+            lines = []
+            for r in sorted(ratings, key=lambda x: -(x["rating_sum"] / x["rating_count"] if x["rating_count"] else 0)):
+                did = r["discord_id"]
+                if r["rating_count"] == 0:
+                    continue
+                avg = round(r["rating_sum"] / r["rating_count"], 2)
+                name = player_names.get(did, did)
+                lines.append(f"**{name}** — ⭐ {avg}/5 ({r['rating_count']} ratings)")
+            if lines:
+                embed.add_field(name="⭐ Avg Rating Received", value="\n".join(lines[:20]), inline=False)
+            else:
+                embed.add_field(name="⭐ Avg Rating Received", value="_No ratings yet._", inline=False)
+        else:
+            embed.add_field(name="⭐ Avg Rating Received", value="_No ratings yet._", inline=False)
+
+        # ── Engagement ────────────────────────────────────────────────────────
+        if engagement:
+            lines = []
+            for e in sorted(engagement, key=lambda x: -(x["ratings_given"])):
+                did = e["discord_id"]
+                name = player_names.get(did, did)
+                gp = games_map.get(did, 0)
+                gwith = e["games_with_ratings"]
+                # Engagement rate: rating sessions completed / games played (when enabled)
+                eng_rate = round(gwith / gp * 100, 1) if gp > 0 else 0.0
+                avg_given = round(e["rating_sum_given"] / e["ratings_given"], 2) if e["ratings_given"] > 0 else "—"
+                lines.append(
+                    f"**{name}** — {gwith}/{gp} games rated ({eng_rate}%) · "
+                    f"avg given: {avg_given} · total given: {e['ratings_given']}"
+                )
+            if lines:
+                embed.add_field(name="📊 Rating Engagement", value="\n".join(lines[:20]), inline=False)
+            else:
+                embed.add_field(name="📊 Rating Engagement", value="_No engagement data yet._", inline=False)
+        else:
+            embed.add_field(name="📊 Rating Engagement", value="_No engagement data yet._", inline=False)
+
+        embed.set_footer(text="Engagement rate = rating sessions completed ÷ games played (only when peer ratings were enabled).")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ── /lol_help ─────────────────────────────────────────────────────────────
 
@@ -212,8 +288,9 @@ class Settings(commands.Cog):
                 "`/settings` — View server settings\n"
                 "`/configure_channels` — Set Team 1/2/Lobby VCs\n"
                 "`/configure_mod_channel` — Set mod log text channel\n"
-                "`/toggle_setting` — Toggle features (Power Rankings, Champ Weight)\n"
+                "`/toggle_setting` — Toggle features (Power Rankings, Champ Weight, Peer Ratings)\n"
                 "`/set_champ_rerolls [count]` — Rerolls per player per game\n"
+                "`/view_ratings` — View peer rating scores and engagement\n"
                 "`/admin_register [member]` — Manually register a player\n"
                 "`/set_weight [member] [1-10]` — Set power ranking weight\n"
                 "`/view_weights` — View all power weights\n"

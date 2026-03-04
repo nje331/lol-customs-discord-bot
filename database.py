@@ -99,8 +99,6 @@ class Database:
                 name         TEXT NOT NULL,
                 role         TEXT NOT NULL,   -- TOP, JUNGLE, MIDDLE, BOTTOM, SUPPORT
                 play_rate    REAL DEFAULT 0,
-                win_rate     REAL DEFAULT 0,
-                ban_rate     REAL DEFAULT 0,
                 patch        TEXT NOT NULL,
                 updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (champ_id, role)
@@ -112,6 +110,26 @@ class Database:
                 rerolls_used INTEGER DEFAULT 0,
                 PRIMARY KEY (game_id, discord_id)
             );
+
+            -- Aggregated peer ratings received by each player
+            CREATE TABLE IF NOT EXISTS player_ratings (
+                discord_id        TEXT NOT NULL,
+                guild_id          TEXT NOT NULL,
+                rating_sum        REAL DEFAULT 0,
+                rating_count      INTEGER DEFAULT 0,
+                PRIMARY KEY (discord_id, guild_id)
+            );
+
+            -- Engagement: tracks how much each rater participates
+            -- (only counts when rating system is enabled at game time)
+            CREATE TABLE IF NOT EXISTS rating_engagement (
+                discord_id          TEXT NOT NULL,
+                guild_id            TEXT NOT NULL,
+                ratings_given       INTEGER DEFAULT 0,
+                rating_sum_given    REAL DEFAULT 0,
+                games_with_ratings  INTEGER DEFAULT 0,
+                PRIMARY KEY (discord_id, guild_id)
+            );
         """)
         # Safe migrations for existing databases
         for migration in [
@@ -120,6 +138,7 @@ class Database:
             "ALTER TABLE guild_settings ADD COLUMN mod_channel_id TEXT",
             "ALTER TABLE guild_settings ADD COLUMN champ_weight_enabled INTEGER DEFAULT 0",
             "ALTER TABLE guild_settings ADD COLUMN champ_rerolls INTEGER DEFAULT 0",
+            "ALTER TABLE guild_settings ADD COLUMN peer_ratings_enabled INTEGER DEFAULT 0",
         ]:
             try:
                 await self.db.execute(migration)
@@ -413,19 +432,16 @@ class Database:
     # ── Champions ────────────────────────────────────────────────────────────
 
     async def upsert_champion(self, champ_id: str, name: str, role: str,
-                               play_rate: float, win_rate: float, ban_rate: float,
-                               patch: str):
+                               play_rate: float, patch: str):
         await self.db.execute("""
-            INSERT INTO champions (champ_id, name, role, play_rate, win_rate, ban_rate, patch, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO champions (champ_id, name, role, play_rate, patch, updated_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(champ_id, role) DO UPDATE SET
                 name       = excluded.name,
                 play_rate  = excluded.play_rate,
-                win_rate   = excluded.win_rate,
-                ban_rate   = excluded.ban_rate,
                 patch      = excluded.patch,
                 updated_at = CURRENT_TIMESTAMP
-        """, (champ_id, name, role, play_rate, win_rate, ban_rate, patch))
+        """, (champ_id, name, role, play_rate, patch))
 
     async def commit(self):
         await self.db.commit()
@@ -479,3 +495,85 @@ class Database:
                 rerolls_used = rerolls_used + 1
         """, (game_id, discord_id))
         await self.db.commit()
+
+    # ── Peer Ratings ─────────────────────────────────────────────────────────
+
+    async def add_rating(self, rated_id: str, rater_id: str, guild_id: str, score: float):
+        """
+        Add one rating to the rated player's aggregate.
+        Also update the rater's engagement stats (ratings_given, rating_sum_given).
+        Call commit_ratings_session() after a full rating session to increment
+        games_with_ratings for the rater.
+        """
+        # Aggregate on the rated player side
+        await self.db.execute("""
+            INSERT INTO player_ratings (discord_id, guild_id, rating_sum, rating_count)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT(discord_id, guild_id) DO UPDATE SET
+                rating_sum   = rating_sum + excluded.rating_sum,
+                rating_count = rating_count + 1
+        """, (rated_id, guild_id, score))
+
+        # Engagement stats on the rater side
+        await self.db.execute("""
+            INSERT INTO rating_engagement (discord_id, guild_id, ratings_given, rating_sum_given, games_with_ratings)
+            VALUES (?, ?, 1, ?, 0)
+            ON CONFLICT(discord_id, guild_id) DO UPDATE SET
+                ratings_given    = ratings_given + 1,
+                rating_sum_given = rating_sum_given + excluded.rating_sum_given
+        """, (rater_id, guild_id, score))
+
+        await self.db.commit()
+
+    async def finish_rating_session(self, rater_id: str, guild_id: str):
+        """Increment games_with_ratings for the rater after they complete a full rating flow."""
+        await self.db.execute("""
+            INSERT INTO rating_engagement (discord_id, guild_id, ratings_given, rating_sum_given, games_with_ratings)
+            VALUES (?, ?, 0, 0, 1)
+            ON CONFLICT(discord_id, guild_id) DO UPDATE SET
+                games_with_ratings = games_with_ratings + 1
+        """, (rater_id, guild_id))
+        await self.db.commit()
+
+    async def get_player_rating(self, discord_id: str, guild_id: str) -> dict:
+        """Return aggregate rating data for a player."""
+        async with self.db.execute(
+            "SELECT * FROM player_ratings WHERE discord_id=? AND guild_id=?",
+            (discord_id, guild_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return dict(row)
+            return {"discord_id": discord_id, "guild_id": guild_id, "rating_sum": 0, "rating_count": 0}
+
+    async def get_rating_engagement(self, discord_id: str, guild_id: str) -> dict:
+        """Return engagement stats for a rater."""
+        async with self.db.execute(
+            "SELECT * FROM rating_engagement WHERE discord_id=? AND guild_id=?",
+            (discord_id, guild_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return dict(row)
+            return {
+                "discord_id": discord_id, "guild_id": guild_id,
+                "ratings_given": 0, "rating_sum_given": 0, "games_with_ratings": 0
+            }
+
+    async def get_all_ratings(self, guild_id: str) -> list[dict]:
+        """Return all players with any rating data for a guild."""
+        async with self.db.execute(
+            "SELECT * FROM player_ratings WHERE guild_id=? ORDER BY rating_count DESC",
+            (guild_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    async def get_all_engagement(self, guild_id: str) -> list[dict]:
+        """Return all engagement rows for a guild."""
+        async with self.db.execute(
+            "SELECT * FROM rating_engagement WHERE guild_id=? ORDER BY ratings_given DESC",
+            (guild_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]

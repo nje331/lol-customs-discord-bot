@@ -1,4 +1,6 @@
 .env
 __pycache__/
 TODO.txt
-*.db
+*.ipynb
+elo.py
+lol_bot.db

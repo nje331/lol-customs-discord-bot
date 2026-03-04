@@ -565,6 +565,148 @@ class StartGameView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=None)
 
 
+# ── Peer Rating Flow ──────────────────────────────────────────────────────────
+
+STAR_LABELS = {1: "1 ⭐", 2: "2 ⭐⭐", 3: "3 ⭐⭐⭐", 4: "4 ⭐⭐⭐⭐", 5: "5 ⭐⭐⭐⭐⭐"}
+
+
+def _player_context_line(player: dict, all_assign: dict, champ_assign: dict) -> str:
+    """Build a compact context string: Name (Role · Champion) if available."""
+    parts = []
+    role = all_assign.get(player["discord_id"])
+    if role and role != "Fill":
+        parts.append(role)
+    champ = champ_assign.get(player["discord_id"])
+    if champ:
+        parts.append(champ)
+    ctx = f" ({' · '.join(parts)})" if parts else ""
+    return f"**{player['display_name']}**{ctx}"
+
+
+class SingleRatingView(discord.ui.View):
+    """
+    A view with 5 star buttons for rating one player.
+    Resolves a future with the chosen score.
+    """
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.future: asyncio.Future = asyncio.get_event_loop().create_future()
+
+        for score in range(1, 6):
+            btn = discord.ui.Button(
+                label=STAR_LABELS[score],
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"rate_{score}",
+                row=0
+            )
+            async def _cb(inter: discord.Interaction, s=score):
+                if not self.future.done():
+                    self.future.set_result(s)
+                self.stop()
+                # Acknowledge without sending a new message; we'll edit the original
+                await inter.response.defer()
+            btn.callback = _cb
+            self.add_item(btn)
+
+
+async def _run_rating_flow(
+    member: discord.Member,
+    rater_id: str,
+    guild_id: str,
+    teammates: list,
+    opponents: list,
+    all_assign: dict,
+    champ_assign: dict,
+    game_num: int,
+    db,
+):
+    """
+    Send a DM rating flow to one player.
+    Iterates teammates then opponents, editing the same message each step.
+    """
+    try:
+        dm = await member.create_dm()
+    except Exception:
+        return
+
+    to_rate = [("teammate", p) for p in teammates] + [("opponent", p) for p in opponents]
+    total = len(to_rate)
+
+    # Send the initial message
+    try:
+        intro_embed = discord.Embed(
+            title=f"⭐ Post-Game Ratings — Game #{game_num}",
+            description=(
+                f"Rate your {total} fellow players one by one.\n"
+                "Your ratings are anonymous and averaged over time."
+            ),
+            color=0xF1C40F
+        )
+        dm_msg = await dm.send(embed=intro_embed)
+    except discord.Forbidden:
+        return  # DMs closed
+    except Exception:
+        return
+
+    ratings_given = 0
+
+    for idx, (rel, target) in enumerate(to_rate, start=1):
+        rel_label = "🤝 Teammate" if rel == "teammate" else "⚔️ Opponent"
+        context_line = _player_context_line(target, all_assign, champ_assign)
+
+        embed = discord.Embed(
+            title=f"⭐ Rate Player ({idx}/{total})",
+            description=(
+                f"{rel_label}: {context_line}\n\n"
+                "How would you rate this player's performance?"
+            ),
+            color=0x5865F2
+        )
+
+        view = SingleRatingView()
+        try:
+            await dm_msg.edit(embed=embed, view=view)
+        except Exception:
+            return
+
+        try:
+            score = await asyncio.wait_for(view.future, timeout=300)
+        except asyncio.TimeoutError:
+            # Player timed out — stop the flow silently
+            try:
+                timeout_embed = discord.Embed(
+                    title="⏰ Rating Timed Out",
+                    description="You didn't respond in time. Your remaining ratings were skipped.",
+                    color=0xED4245
+                )
+                await dm_msg.edit(embed=timeout_embed, view=None)
+            except Exception:
+                pass
+            return
+
+        # Store the rating
+        await db.add_rating(
+            rated_id=target["discord_id"],
+            rater_id=rater_id,
+            guild_id=guild_id,
+            score=float(score),
+        )
+        ratings_given += 1
+
+    # All done
+    await db.finish_rating_session(rater_id, guild_id)
+
+    try:
+        done_embed = discord.Embed(
+            title="✅ Ratings Complete",
+            description=f"You've finished rating all {ratings_given} player(s). Thanks!",
+            color=0x57F287
+        )
+        await dm_msg.edit(embed=done_embed, view=None)
+    except Exception:
+        pass
+
+
 class InProgressView(discord.ui.View):
     """
     Shown after Start Game is pressed. Has winner buttons (row 0) and optionally
@@ -653,6 +795,9 @@ class InProgressView(discord.ui.View):
         # Post reroll summary to mod channel last
         await self._post_reroll_summary(interaction)
 
+        # Trigger peer rating DMs if enabled
+        await self._send_rating_dms(interaction)
+
         await interaction.message.edit(embed=embed, view=next_view)
 
     async def _post_reroll_summary(self, interaction: discord.Interaction):
@@ -711,6 +856,53 @@ class InProgressView(discord.ui.View):
                 lines.append(f"• **{names[did]}** ({remaining} left): {chain_str}")
 
             await mod_ch.send("\n".join(lines))
+        except Exception:
+            pass
+
+    async def _send_rating_dms(self, interaction: discord.Interaction):
+        """Send peer rating DM flows to all playing players (not bench) if enabled."""
+        try:
+            if not self.settings.get("peer_ratings_enabled"):
+                return
+
+            guild = interaction.guild
+            guild_id = str(interaction.guild_id)
+            sv = self.start_view
+
+            # Build context dicts for each playing player
+            # assign_roles and champ_assignments live on start_view
+            all_assign: dict[str, str] = {**sv.team1_assign, **sv.team2_assign} if sv.assign_roles else {}
+            champ_assign: dict[str, str] = sv.champ_assignments if sv.random_champs else {}
+
+            playing_ids = {p["discord_id"] for p in self.team1 + self.team2}
+
+            for rater in self.team1 + self.team2:
+                rater_id = rater["discord_id"]
+                # teammates are same-team players excluding self
+                teammates = [p for p in (self.team1 if rater in self.team1 else self.team2) if p["discord_id"] != rater_id]
+                opponents = self.team2 if rater in self.team1 else self.team1
+
+                member = guild.get_member(int(rater_id))
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(int(rater_id))
+                    except Exception:
+                        continue
+
+                # Fire-and-forget per player; errors are silently swallowed
+                asyncio.create_task(
+                    _run_rating_flow(
+                        member=member,
+                        rater_id=rater_id,
+                        guild_id=guild_id,
+                        teammates=teammates,
+                        opponents=opponents,
+                        all_assign=all_assign,
+                        champ_assign=champ_assign,
+                        game_num=sv.game_num,
+                        db=self.db,
+                    )
+                )
         except Exception:
             pass
 
