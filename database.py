@@ -4,7 +4,6 @@ Database module - handles all SQLite operations via aiosqlite.
 
 import aiosqlite
 import json
-import os
 from typing import Optional
 
 
@@ -30,7 +29,6 @@ class Database:
                 games_played INTEGER DEFAULT 0,
                 games_won    INTEGER DEFAULT 0,
                 games_lost   INTEGER DEFAULT 0,
-                power_weight REAL DEFAULT 5.0,
                 PRIMARY KEY (discord_id, guild_id)
             );
 
@@ -41,27 +39,26 @@ class Database:
             );
 
             CREATE TABLE IF NOT EXISTS guild_settings (
-                guild_id            TEXT PRIMARY KEY,
-                team1_channel_id    TEXT,
-                team2_channel_id    TEXT,
-                lobby_channel_id    TEXT,
-                mod_channel_id      TEXT,
-                use_power_rankings  INTEGER DEFAULT 0,
+                guild_id             TEXT PRIMARY KEY,
+                team1_channel_id     TEXT,
+                team2_channel_id     TEXT,
+                lobby_channel_id     TEXT,
+                mod_channel_id       TEXT,
                 champ_weight_enabled INTEGER DEFAULT 0,
-                champ_rerolls       INTEGER DEFAULT 0
+                champ_rerolls        INTEGER DEFAULT 0,
+                peer_ratings_enabled INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS sessions (
-                id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id         TEXT NOT NULL,
-                owner_id         TEXT NOT NULL DEFAULT '',
-                started_at       DATETIME DEFAULT CURRENT_TIMESTAMP,
-                ended_at         DATETIME,
-                is_active        INTEGER DEFAULT 1,
-                game_number      INTEGER DEFAULT 0,
-                track_roles      INTEGER DEFAULT 1,
-                repeat_roles     INTEGER DEFAULT 0,
-                auto_balance     TEXT DEFAULT 'off'
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id     TEXT NOT NULL,
+                owner_id     TEXT NOT NULL DEFAULT '',
+                started_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+                ended_at     DATETIME,
+                is_active    INTEGER DEFAULT 1,
+                game_number  INTEGER DEFAULT 0,
+                repeat_roles INTEGER DEFAULT 0,
+                auto_balance TEXT DEFAULT 'off'
             );
 
             CREATE TABLE IF NOT EXISTS session_players (
@@ -97,12 +94,12 @@ class Database:
             );
 
             CREATE TABLE IF NOT EXISTS champions (
-                champ_id     TEXT NOT NULL,   -- numeric champion ID as string
-                name         TEXT NOT NULL,
-                role         TEXT NOT NULL,   -- TOP, JUNGLE, MIDDLE, BOTTOM, SUPPORT
-                play_rate    REAL DEFAULT 0,
-                patch        TEXT NOT NULL,
-                updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+                champ_id   TEXT NOT NULL,
+                name       TEXT NOT NULL,
+                role       TEXT NOT NULL,
+                play_rate  REAL DEFAULT 0,
+                patch      TEXT NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (champ_id, role)
             );
 
@@ -117,63 +114,46 @@ class Database:
             -- elo_type: 'total' | 'roles_pref' | 'roles_random' | 'no_roles'
             --           | 'champs_roles_pref' | 'champs_roles_random' | 'draft'
             CREATE TABLE IF NOT EXISTS player_elo (
-                discord_id   TEXT NOT NULL,
-                guild_id     TEXT NOT NULL,
-                elo_type     TEXT NOT NULL,
-                elo          REAL DEFAULT 1500.0,
-                wins         INTEGER DEFAULT 0,
-                losses       INTEGER DEFAULT 0,
-                games        INTEGER DEFAULT 0,
+                discord_id TEXT NOT NULL,
+                guild_id   TEXT NOT NULL,
+                elo_type   TEXT NOT NULL,
+                elo        REAL DEFAULT 1500.0,
+                wins       INTEGER DEFAULT 0,
+                losses     INTEGER DEFAULT 0,
+                games      INTEGER DEFAULT 0,
                 PRIMARY KEY (discord_id, guild_id, elo_type)
             );
 
             -- Full ELO history: one row per game per player per elo_type
             CREATE TABLE IF NOT EXISTS elo_history (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                discord_id   TEXT NOT NULL,
-                guild_id     TEXT NOT NULL,
-                elo_type     TEXT NOT NULL,
-                elo_after    REAL NOT NULL,
-                game_id      INTEGER NOT NULL,
-                recorded_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                discord_id  TEXT NOT NULL,
+                guild_id    TEXT NOT NULL,
+                elo_type    TEXT NOT NULL,
+                elo_after   REAL NOT NULL,
+                game_id     INTEGER NOT NULL,
+                recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
             -- Aggregated peer ratings received by each player
             CREATE TABLE IF NOT EXISTS player_ratings (
-                discord_id        TEXT NOT NULL,
-                guild_id          TEXT NOT NULL,
-                rating_sum        REAL DEFAULT 0,
-                rating_count      INTEGER DEFAULT 0,
+                discord_id   TEXT NOT NULL,
+                guild_id     TEXT NOT NULL,
+                rating_sum   REAL DEFAULT 0,
+                rating_count INTEGER DEFAULT 0,
                 PRIMARY KEY (discord_id, guild_id)
             );
 
             -- Engagement: tracks how much each rater participates
-            -- (only counts when rating system is enabled at game time)
             CREATE TABLE IF NOT EXISTS rating_engagement (
-                discord_id          TEXT NOT NULL,
-                guild_id            TEXT NOT NULL,
-                ratings_given       INTEGER DEFAULT 0,
-                rating_sum_given    REAL DEFAULT 0,
-                games_with_ratings  INTEGER DEFAULT 0,
+                discord_id         TEXT NOT NULL,
+                guild_id           TEXT NOT NULL,
+                ratings_given      INTEGER DEFAULT 0,
+                rating_sum_given   REAL DEFAULT 0,
+                games_with_ratings INTEGER DEFAULT 0,
                 PRIMARY KEY (discord_id, guild_id)
             );
         """)
-        # Safe migrations for existing databases
-        for migration in [
-            "ALTER TABLE sessions ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE sessions ADD COLUMN track_roles INTEGER DEFAULT 1",
-            "ALTER TABLE sessions ADD COLUMN repeat_roles INTEGER DEFAULT 0",
-            "ALTER TABLE sessions ADD COLUMN auto_balance TEXT DEFAULT 'off'",
-            "ALTER TABLE guild_settings ADD COLUMN mod_channel_id TEXT",
-            "ALTER TABLE guild_settings ADD COLUMN champ_weight_enabled INTEGER DEFAULT 0",
-            "ALTER TABLE guild_settings ADD COLUMN champ_rerolls INTEGER DEFAULT 0",
-            "ALTER TABLE guild_settings ADD COLUMN peer_ratings_enabled INTEGER DEFAULT 0",
-        ]:
-            try:
-                await self.db.execute(migration)
-                await self.db.commit()
-            except Exception:
-                pass
         await self.db.commit()
 
     # ── Bot Admins ───────────────────────────────────────────────────────────
@@ -193,7 +173,8 @@ class Database:
 
     async def remove_bot_admin(self, discord_id: str, guild_id: str):
         await self.db.execute(
-            "DELETE FROM bot_admins WHERE discord_id=? AND guild_id=?", (discord_id, guild_id)
+            "DELETE FROM bot_admins WHERE discord_id=? AND guild_id=?",
+            (discord_id, guild_id)
         )
         await self.db.commit()
 
@@ -240,13 +221,6 @@ class Database:
         )
         await self.db.commit()
 
-    async def update_player_weight(self, discord_id: str, guild_id: str, weight: float):
-        await self.db.execute(
-            "UPDATE players SET power_weight=? WHERE discord_id=? AND guild_id=?",
-            (weight, discord_id, guild_id)
-        )
-        await self.db.commit()
-
     async def delete_player(self, discord_id: str, guild_id: str):
         await self.db.execute(
             "DELETE FROM players WHERE discord_id=? AND guild_id=?",
@@ -289,7 +263,7 @@ class Database:
     async def create_session(self, guild_id: str, owner_id: str, repeat_roles: bool = False,
                               auto_balance: str = "off") -> int:
         cursor = await self.db.execute(
-            "INSERT INTO sessions (guild_id, owner_id, track_roles, repeat_roles, auto_balance) VALUES (?, ?, 1, ?, ?)",
+            "INSERT INTO sessions (guild_id, owner_id, repeat_roles, auto_balance) VALUES (?, ?, ?, ?)",
             (guild_id, owner_id, 1 if repeat_roles else 0, auto_balance)
         )
         await self.db.commit()
@@ -434,14 +408,6 @@ class Database:
                 result.append(d)
             return result
 
-    async def reset_leaderboard(self, guild_id: str):
-        """Reset all players' games_played, games_won, and games_lost to 0 for this guild."""
-        await self.db.execute(
-            "UPDATE players SET games_played=0, games_won=0, games_lost=0 WHERE guild_id=?",
-            (guild_id,)
-        )
-        await self.db.commit()
-
     # ── Guild Settings ───────────────────────────────────────────────────────
 
     async def get_settings(self, guild_id: str) -> dict:
@@ -457,9 +423,9 @@ class Database:
                 "team2_channel_id": None,
                 "lobby_channel_id": None,
                 "mod_channel_id": None,
-                "use_power_rankings": 0,
                 "champ_weight_enabled": 0,
                 "champ_rerolls": 0,
+                "peer_ratings_enabled": 0,
             }
 
     async def update_setting(self, guild_id: str, key: str, value):
@@ -494,10 +460,7 @@ class Database:
     async def get_champions_for_role(self, role: str, limit: int = 10) -> list[dict]:
         """Return top champions for a role sorted by play rate."""
         async with self.db.execute("""
-            SELECT * FROM champions
-            WHERE role = ?
-            ORDER BY play_rate DESC
-            LIMIT ?
+            SELECT * FROM champions WHERE role=? ORDER BY play_rate DESC LIMIT ?
         """, (role.upper(), limit)) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
@@ -505,9 +468,7 @@ class Database:
     async def get_champion(self, name: str) -> list[dict]:
         """Return all role entries for a champion (case-insensitive partial match)."""
         async with self.db.execute("""
-            SELECT * FROM champions
-            WHERE name LIKE ?
-            ORDER BY play_rate DESC
+            SELECT * FROM champions WHERE name LIKE ? ORDER BY play_rate DESC
         """, (f"%{name}%",)) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
@@ -523,7 +484,6 @@ class Database:
     # ── Champion Rerolls ─────────────────────────────────────────────────────
 
     async def get_champ_rerolls_used(self, game_id: int, discord_id: str) -> int:
-        """Return how many champion rerolls this player has used in this game."""
         async with self.db.execute(
             "SELECT rerolls_used FROM game_champ_rerolls WHERE game_id=? AND discord_id=?",
             (game_id, discord_id)
@@ -532,7 +492,6 @@ class Database:
             return row["rerolls_used"] if row else 0
 
     async def increment_champ_reroll(self, game_id: int, discord_id: str):
-        """Increment a player's reroll count for this game by 1."""
         await self.db.execute("""
             INSERT INTO game_champ_rerolls (game_id, discord_id, rerolls_used)
             VALUES (?, ?, 1)
@@ -544,13 +503,6 @@ class Database:
     # ── Peer Ratings ─────────────────────────────────────────────────────────
 
     async def add_rating(self, rated_id: str, rater_id: str, guild_id: str, score: float):
-        """
-        Add one rating to the rated player's aggregate.
-        Also update the rater's engagement stats (ratings_given, rating_sum_given).
-        Call commit_ratings_session() after a full rating session to increment
-        games_with_ratings for the rater.
-        """
-        # Aggregate on the rated player side
         await self.db.execute("""
             INSERT INTO player_ratings (discord_id, guild_id, rating_sum, rating_count)
             VALUES (?, ?, ?, 1)
@@ -559,7 +511,6 @@ class Database:
                 rating_count = rating_count + 1
         """, (rated_id, guild_id, score))
 
-        # Engagement stats on the rater side
         await self.db.execute("""
             INSERT INTO rating_engagement (discord_id, guild_id, ratings_given, rating_sum_given, games_with_ratings)
             VALUES (?, ?, 1, ?, 0)
@@ -581,7 +532,6 @@ class Database:
         await self.db.commit()
 
     async def get_player_rating(self, discord_id: str, guild_id: str) -> dict:
-        """Return aggregate rating data for a player."""
         async with self.db.execute(
             "SELECT * FROM player_ratings WHERE discord_id=? AND guild_id=?",
             (discord_id, guild_id)
@@ -589,10 +539,10 @@ class Database:
             row = await cursor.fetchone()
             if row:
                 return dict(row)
-            return {"discord_id": discord_id, "guild_id": guild_id, "rating_sum": 0, "rating_count": 0}
+            return {"discord_id": discord_id, "guild_id": guild_id,
+                    "rating_sum": 0, "rating_count": 0}
 
     async def get_rating_engagement(self, discord_id: str, guild_id: str) -> dict:
-        """Return engagement stats for a rater."""
         async with self.db.execute(
             "SELECT * FROM rating_engagement WHERE discord_id=? AND guild_id=?",
             (discord_id, guild_id)
@@ -606,7 +556,6 @@ class Database:
             }
 
     async def get_all_ratings(self, guild_id: str) -> list[dict]:
-        """Return all players with any rating data for a guild."""
         async with self.db.execute(
             "SELECT * FROM player_ratings WHERE guild_id=? ORDER BY rating_count DESC",
             (guild_id,)
@@ -615,7 +564,6 @@ class Database:
             return [dict(r) for r in rows]
 
     async def get_all_engagement(self, guild_id: str) -> list[dict]:
-        """Return all engagement rows for a guild."""
         async with self.db.execute(
             "SELECT * FROM rating_engagement WHERE guild_id=? ORDER BY ratings_given DESC",
             (guild_id,)
@@ -626,7 +574,7 @@ class Database:
     # ── ELO ──────────────────────────────────────────────────────────────────
 
     async def get_player_elo(self, discord_id: str, guild_id: str, elo_type: str) -> dict:
-        """Return ELO row for a player/guild/type, creating a default if absent."""
+        """Return ELO row for a player/guild/type, returning a default 1500 if absent."""
         async with self.db.execute(
             "SELECT * FROM player_elo WHERE discord_id=? AND guild_id=? AND elo_type=?",
             (discord_id, guild_id, elo_type)
@@ -647,24 +595,25 @@ class Database:
             return [dict(r) for r in rows]
 
     async def update_player_elo(self, discord_id: str, guild_id: str, elo_type: str,
-                                  new_elo: float, won: bool):
+                                 new_elo: float, won: bool):
         """Upsert an ELO value and increment win/loss/games counters."""
         w_col = "wins" if won else "losses"
         await self.db.execute(f"""
             INSERT INTO player_elo (discord_id, guild_id, elo_type, elo, {w_col}, games)
             VALUES (?, ?, ?, ?, 1, 1)
             ON CONFLICT(discord_id, guild_id, elo_type) DO UPDATE SET
-                elo    = excluded.elo,
+                elo     = excluded.elo,
                 {w_col} = {w_col} + 1,
-                games  = games + 1
+                games   = games + 1
         """, (discord_id, guild_id, elo_type, new_elo))
         await self.db.commit()
 
     async def record_elo_history(self, discord_id: str, guild_id: str, elo_type: str,
-                                   elo_after: float, game_id: int):
+                                  elo_after: float, game_id: int):
         """Append one ELO history entry."""
         await self.db.execute(
-            "INSERT INTO elo_history (discord_id, guild_id, elo_type, elo_after, game_id) VALUES (?,?,?,?,?)",
+            "INSERT INTO elo_history (discord_id, guild_id, elo_type, elo_after, game_id) "
+            "VALUES (?, ?, ?, ?, ?)",
             (discord_id, guild_id, elo_type, elo_after, game_id)
         )
         await self.db.commit()
@@ -674,7 +623,8 @@ class Database:
         """Return ELO history rows ordered by game_id. Optionally filter by player."""
         if discord_id:
             async with self.db.execute(
-                "SELECT * FROM elo_history WHERE guild_id=? AND discord_id=? AND elo_type=? ORDER BY game_id ASC",
+                "SELECT * FROM elo_history "
+                "WHERE guild_id=? AND discord_id=? AND elo_type=? ORDER BY game_id ASC",
                 (guild_id, discord_id, elo_type)
             ) as cursor:
                 rows = await cursor.fetchall()
@@ -685,3 +635,21 @@ class Database:
             ) as cursor:
                 rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+    # ── Stats Reset ──────────────────────────────────────────────────────────
+
+    async def reset_leaderboard(self, guild_id: str):
+        """Reset all players' win/loss stats, ELOs back to 1500, and wipe ELO history."""
+        await self.db.execute(
+            "UPDATE players SET games_played=0, games_won=0, games_lost=0 WHERE guild_id=?",
+            (guild_id,)
+        )
+        await self.db.execute(
+            "UPDATE player_elo SET elo=1500.0, wins=0, losses=0, games=0 WHERE guild_id=?",
+            (guild_id,)
+        )
+        await self.db.execute(
+            "DELETE FROM elo_history WHERE guild_id=?",
+            (guild_id,)
+        )
+        await self.db.commit()
