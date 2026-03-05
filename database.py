@@ -442,6 +442,11 @@ class Database:
 
     # ── Champions ────────────────────────────────────────────────────────────
 
+    async def clear_champions(self):
+        """Delete all champion entries — called before a fresh patch sync."""
+        await self.db.execute("DELETE FROM champions")
+        await self.db.commit()
+
     async def upsert_champion(self, champ_id: str, name: str, role: str,
                                play_rate: float, patch: str):
         await self.db.execute("""
@@ -639,7 +644,8 @@ class Database:
     # ── Stats Reset ──────────────────────────────────────────────────────────
 
     async def reset_leaderboard(self, guild_id: str):
-        """Reset all players' win/loss stats, ELOs back to 1500, and wipe ELO history."""
+        """Reset all players' win/loss stats, ELOs back to 1500, wipe ELO history,
+        and clear all peer ratings and engagement data."""
         await self.db.execute(
             "UPDATE players SET games_played=0, games_won=0, games_lost=0 WHERE guild_id=?",
             (guild_id,)
@@ -650,6 +656,14 @@ class Database:
         )
         await self.db.execute(
             "DELETE FROM elo_history WHERE guild_id=?",
+            (guild_id,)
+        )
+        await self.db.execute(
+            "DELETE FROM player_ratings WHERE guild_id=?",
+            (guild_id,)
+        )
+        await self.db.execute(
+            "DELETE FROM rating_engagement WHERE guild_id=?",
             (guild_id,)
         )
         await self.db.commit()

@@ -98,6 +98,7 @@ class Champions(commands.Cog):
         }
 
         updated_count = 0
+        await self.db.clear_champions()
         for raw_role, champs in stats_data.items():
             role_key = raw_role.upper()
             if role_key not in VALID_ROLES:
