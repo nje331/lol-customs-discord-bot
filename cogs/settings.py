@@ -23,11 +23,11 @@ class ChannelSelectView(discord.ui.View):
         vc_options = [
             discord.SelectOption(label=vc.name, value=str(vc.id))
             for vc in guild.voice_channels
-        ]
+        ][:25]
         tc_options = [
             discord.SelectOption(label=tc.name, value=str(tc.id))
             for tc in guild.text_channels
-        ]
+        ][:25]
         if not vc_options:
             return
 
