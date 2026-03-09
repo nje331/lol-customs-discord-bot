@@ -623,6 +623,7 @@ class Session(commands.Cog):
     # ── /session ──────────────────────────────────────────────────────────────
 
     @app_commands.command(name="session", description="View the current roster and session settings.")
+    @is_session_owner()
     async def session_cmd(self, interaction: discord.Interaction):
         guild_id = str(interaction.guild_id)
         session  = await self.db.get_active_session(guild_id)

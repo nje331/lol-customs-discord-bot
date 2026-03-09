@@ -409,23 +409,23 @@ class Settings(commands.Cog):
         is_admin_user = await check_is_admin(interaction)
         is_owner      = await check_is_session_owner(interaction)
 
-        embed = build_embed("LoL Custom Game Bot", color_key="gold")
+        embed = build_embed("LoL Custom Game Bot — Commands", color_key="gold")
 
         embed.add_field(name="👤 Everyone", value=(
-            "`/register` — set your role preferences\n"
+            "`/register` — register & set your role preferences\n"
             "`/edit_roles` — update your role preferences\n"
+            "`/start_session` — open a session (you become session owner)\n"
             "`/leaderboard` — win/loss standings\n"
-            "`/start_session` — open a session (you become owner)\n"
-            "`/session` — view roster and toggle settings\n"
             "`/lol_help` — this message"
         ), inline=False)
 
         if is_owner:
             embed.add_field(name="🎮 Session Owner", value=(
-                "`/add_from_voice` — pull players from a voice channel\n"
-                "`/add_player` — add up to 5 players by mention\n"
+                "`/session` — view roster and toggle settings\n"
+                "`/add_from_voice [channel]` — pull players from a voice channel\n"
+                "`/add_player @p1 [@p2...]` — add up to 5 players\n"
                 "`/remove_player` — remove a player\n"
-                "`/make_teams` — random split into two teams\n"
+                "`/make_teams` — split into two teams\n"
                 "`/start_draft` — captain snake draft\n"
                 "`/end_session` — close the session"
             ), inline=False)
@@ -436,15 +436,18 @@ class Settings(commands.Cog):
                 "`/admins` — manage bot admins\n"
                 "`/players` — registered players and role preferences\n"
                 "`/update_champs` — sync champion data from the current patch\n"
-                "`/view_champs` — browse and edit champion pools\n"
+                "`/view_champs [role]` — browse and edit champion pools\n"
                 "`/clear_custom_champs` — remove all custom champions\n"
-                "`/view_elo` — ELO leaderboard\n"
-                "`/elo_history` — ELO history chart\n"
-                "`/view_ratings` — peer rating scores\n"
+                "`/view_elo [type]` — ELO leaderboard\n"
+                "`/elo_history [type] [member]` — ELO history chart\n"
+                "`/view_ratings` — peer rating scores and engagement"
                 "`/reset_stats` — wipe all stats and ELO history"
             ), inline=False)
 
-        embed.set_footer(text="Parameters are described when you type each command.")
+        embed.set_footer(text=(
+            "repeat_roles is OFF by default — players won't get the same role twice per session. "
+            "auto_balance can be set at session start or changed via /session."
+        ))
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
