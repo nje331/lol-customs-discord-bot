@@ -507,6 +507,35 @@ class Database:
         await self.db.commit()
         return cursor.rowcount
 
+    async def get_champions_for_role_merged(self, guild_id: str, role: str,
+                                              limit: int = 50) -> list[dict]:
+        """Return synced + custom champions for a role as a single list for random assignment.
+        Synced entries are sorted by play_rate DESC (up to limit); custom entries are appended
+        with play_rate=0.001 so they participate in weighted picks without dominating.
+        Custom champions that share a name with a synced champion are deduplicated (synced wins)."""
+        role_upper = role.upper()
+
+        async with self.db.execute(
+            "SELECT * FROM champions WHERE role=? ORDER BY play_rate DESC LIMIT ?",
+            (role_upper, limit)
+        ) as cursor:
+            synced = [dict(r) for r in await cursor.fetchall()]
+
+        synced_names_lower = {r["name"].lower() for r in synced}
+
+        custom_rows = await self.get_custom_champions(guild_id, role_upper)
+        for c in custom_rows:
+            if c["name"].lower() not in synced_names_lower:
+                synced.append({
+                    "champ_id": f"custom_{c['id']}",
+                    "name": c["name"],
+                    "role": role_upper,
+                    "play_rate": 0.001,
+                    "patch": "custom",
+                })
+
+        return synced
+
     async def get_all_champions_for_role(self, guild_id: str, role: str) -> dict:
         """Return both patch-synced and custom champions for a role.
         Returns {'synced': [...], 'custom': [...]}"""

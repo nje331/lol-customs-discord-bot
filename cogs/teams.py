@@ -239,10 +239,12 @@ def _assign_roles(team: list, session_role_history: dict, track_roles: bool,
 
 
 async def _assign_champs(assignments: dict[str, str], db,
+                         guild_id: str,
                          use_weights: bool = False,
                          exclude: set[str] | None = None) -> dict[str, str]:
     """
     Given {discord_id: role}, returns {discord_id: champion_name}.
+    guild_id: used to include custom champions in the pool.
     use_weights: if True, weight picks by play rate; otherwise uniform random.
     exclude: set of champion names already in use (prevents duplicates across calls).
     No champion assigned twice within this call.
@@ -256,7 +258,7 @@ async def _assign_champs(assignments: dict[str, str], db,
             champ_assignment[did] = ""
             continue
 
-        rows = await db.get_champions_for_role(cdr_role, limit=50)
+        rows = await db.get_champions_for_role_merged(guild_id, cdr_role, limit=50)
         if not rows:
             champ_assignment[did] = ""
             continue
@@ -278,12 +280,13 @@ async def _assign_champs(assignments: dict[str, str], db,
 
 
 async def _reroll_one_champ(discord_id: str, role: str, db,
+                             guild_id: str,
                              use_weights: bool, exclude: set[str]) -> str:
     """Pick a single new champion for one player, excluding already-assigned champs."""
     cdr_role = ROLE_TO_CDR.get(role, "")
     if not cdr_role:
         return ""
-    rows = await db.get_champions_for_role(cdr_role, limit=50)
+    rows = await db.get_champions_for_role_merged(guild_id, cdr_role, limit=50)
     if not rows:
         return ""
     available = [r for r in rows if r["name"] not in exclude]
@@ -560,7 +563,7 @@ class StartGameView(discord.ui.View):
             own_history = self._rolled_champs.get(discord_id, set())
             exclude = others_champs | own_history
 
-            new_champ = await _reroll_one_champ(discord_id, role, db, use_weights, exclude)
+            new_champ = await _reroll_one_champ(discord_id, role, db, str(interaction.guild_id), use_weights, exclude)
             if not new_champ:
                 await interaction.response.send_message(
                     "No champion data available for your role.", ephemeral=True
@@ -1760,10 +1763,10 @@ class Teams(commands.Cog):
                 no_champ_warning = "\n⚠️ No champion data found — run `/update_champs` first."
             else:
                 if assign_roles:
-                    team1_champs = await _assign_champs(team1_assign, self.db, use_weights=use_weights)
+                    team1_champs = await _assign_champs(team1_assign, self.db, guild_id, use_weights=use_weights)
                     # Pass team1 champs as exclude so team2 can't get the same champ
                     team2_champs = await _assign_champs(
-                        team2_assign, self.db, use_weights=use_weights,
+                        team2_assign, self.db, guild_id, use_weights=use_weights,
                         exclude=set(team1_champs.values())
                     )
                 else:
@@ -1773,9 +1776,9 @@ class Teams(commands.Cog):
                     temp_assign = {p["discord_id"]: temp_roles[i] for i, p in enumerate(all_playing)}
                     t1_temp = {p["discord_id"]: temp_assign[p["discord_id"]] for p in team1}
                     t2_temp = {p["discord_id"]: temp_assign[p["discord_id"]] for p in team2}
-                    team1_champs = await _assign_champs(t1_temp, self.db, use_weights=use_weights)
+                    team1_champs = await _assign_champs(t1_temp, self.db, guild_id, use_weights=use_weights)
                     team2_champs = await _assign_champs(
-                        t2_temp, self.db, use_weights=use_weights,
+                        t2_temp, self.db, guild_id, use_weights=use_weights,
                         exclude=set(team1_champs.values())
                     )
 
