@@ -414,7 +414,7 @@ class Settings(commands.Cog):
         embed.add_field(name="👤 Everyone", value=(
             "`/register` — register & set your role preferences\n"
             "`/edit_roles` — update your role preferences\n"
-            "`/start_session` — open a session (you become session owner)\n"
+            "`/start_session [repeat_roles] [auto_balance]` — open a session & become session owner\n"
             "`/leaderboard` — win/loss standings\n"
             "`/lol_help` — this message"
         ), inline=False)
@@ -425,7 +425,7 @@ class Settings(commands.Cog):
                 "`/add_from_voice [channel]` — pull players from a voice channel\n"
                 "`/add_player @p1 [@p2...]` — add up to 5 players\n"
                 "`/remove_player` — remove a player\n"
-                "`/make_teams` — split into two teams\n"
+                "`/make_teams [assign_roles] [ignore_prefs] [random_champs]` — split into two teams\n"
                 "`/start_draft` — captain snake draft\n"
                 "`/end_session` — close the session"
             ), inline=False)
