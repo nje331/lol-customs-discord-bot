@@ -9,6 +9,9 @@ from discord.ext import commands
 
 from utils import ROLES, ROLE_EMOJIS, build_embed, fmt_player, is_admin, check_is_admin
 
+# Discord Select menus cap at 25 options
+_SELECT_MAX = 25
+
 
 def _build_role_select_view(author_id: int, callback, existing: list = None):
     """Build and return a RoleSelectView."""
@@ -117,6 +120,217 @@ class RoleSelectView(discord.ui.View):
             return
         self.stop()
         await self.callback(interaction, [])
+
+
+# ── Bot Admins view ───────────────────────────────────────────────────────────
+
+class BotAdminsView(discord.ui.View):
+    """
+    Shown by /bot_admins.
+    Lists: explicitly-added bot admins + members who pass the Discord admin check.
+    Row 0: [➕ Add Admin] [➖ Remove Admin]
+    Add  → dropdown of server members who are NOT already bot admins or Discord admins.
+    Remove → dropdown of ONLY explicitly-added bot admins (Discord admins can't be removed here).
+    """
+
+    def __init__(self, db, guild: discord.Guild, guild_id: str,
+                 bot_admin_ids: list[str], invoker_id: int):
+        super().__init__(timeout=180)
+        self.db           = db
+        self.guild        = guild
+        self.guild_id     = guild_id
+        self.bot_admin_ids = list(bot_admin_ids)
+        self.invoker_id   = invoker_id
+        self._message: discord.Message = None
+        self._rebuild()
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _is_discord_admin(self, member: discord.Member) -> bool:
+        return (
+            member.guild_permissions.administrator
+            or member.guild_permissions.manage_guild
+        )
+
+    def build_embed(self) -> discord.Embed:
+        embed = build_embed("Bot Admins", color_key="gray")
+
+        # Discord admins (always have access, can't be removed via bot)
+        discord_admins = [
+            m for m in self.guild.members
+            if not m.bot and self._is_discord_admin(m)
+        ]
+        if discord_admins:
+            embed.add_field(
+                name="🔐 Discord Admins (always have access)",
+                value="\n".join(f"• {m.display_name}" for m in discord_admins[:20]),
+                inline=False,
+            )
+
+        # Explicit bot admins
+        if self.bot_admin_ids:
+            lines = []
+            for did in self.bot_admin_ids:
+                m = self.guild.get_member(int(did))
+                lines.append(f"• {m.display_name if m else f'Unknown ({did})'}")
+            embed.add_field(
+                name="🤖 Bot Admins (added via bot)",
+                value="\n".join(lines),
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="🤖 Bot Admins (added via bot)",
+                value="_None added yet._",
+                inline=False,
+            )
+
+        embed.set_footer(text="Use the buttons to add or remove bot admins.")
+        return embed
+
+    def _rebuild(self):
+        self.clear_items()
+
+        # Determine who can be added: non-bot members who aren't already Discord admins
+        # or explicit bot admins
+        existing = set(self.bot_admin_ids)
+        addable  = [
+            m for m in self.guild.members
+            if not m.bot
+            and str(m.id) not in existing
+            and not self._is_discord_admin(m)
+        ][:_SELECT_MAX]
+
+        add_btn = discord.ui.Button(
+            label="➕ Add Admin",
+            style=discord.ButtonStyle.success,
+            row=0,
+            disabled=(len(addable) == 0),
+        )
+        add_btn.callback = self._add_admin
+        self.add_item(add_btn)
+
+        rm_btn = discord.ui.Button(
+            label="➖ Remove Admin",
+            style=discord.ButtonStyle.danger,
+            row=0,
+            disabled=(len(self.bot_admin_ids) == 0),
+        )
+        rm_btn.callback = self._remove_admin
+        self.add_item(rm_btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "Only the admin who opened this panel can use these buttons.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def _refresh(self):
+        self.bot_admin_ids = await self.db.get_bot_admins(self.guild_id)
+        self._rebuild()
+        if self._message:
+            try:
+                await self._message.edit(embed=self.build_embed(), view=self)
+            except Exception:
+                pass
+
+    # ── Add ───────────────────────────────────────────────────────────────────
+
+    async def _add_admin(self, interaction: discord.Interaction):
+        existing = set(self.bot_admin_ids)
+        addable  = [
+            m for m in self.guild.members
+            if not m.bot
+            and str(m.id) not in existing
+            and not self._is_discord_admin(m)
+        ][:_SELECT_MAX]
+
+        if not addable:
+            await interaction.response.send_message(
+                "No eligible members to add.", ephemeral=True
+            )
+            return
+
+        options = [
+            discord.SelectOption(label=m.display_name, value=str(m.id))
+            for m in addable
+        ]
+
+        class AddSelect(discord.ui.View):
+            def __init__(self_v):
+                super().__init__(timeout=60)
+                sel = discord.ui.Select(
+                    placeholder="Choose a member to make bot admin…",
+                    options=options,
+                )
+                sel.callback = self_v._on_select
+                self_v.add_item(sel)
+
+            async def _on_select(self_v, inter: discord.Interaction):
+                did    = inter.data["values"][0]
+                member = self.guild.get_member(int(did))
+                self_v.stop()
+                await self.db.add_bot_admin(did, self.guild_id)
+                name = member.display_name if member else f"User {did}"
+                await inter.response.edit_message(
+                    content=f"✅ **{name}** is now a bot admin.", view=None
+                )
+                await self._refresh()
+
+        await interaction.response.send_message(
+            "Select a member to grant bot admin:", view=AddSelect(), ephemeral=True
+        )
+
+    # ── Remove ────────────────────────────────────────────────────────────────
+
+    async def _remove_admin(self, interaction: discord.Interaction):
+        if not self.bot_admin_ids:
+            await interaction.response.send_message(
+                "No bot admins to remove.", ephemeral=True
+            )
+            return
+
+        options = []
+        for did in self.bot_admin_ids[:_SELECT_MAX]:
+            m = self.guild.get_member(int(did))
+            label = m.display_name if m else f"Unknown ({did})"
+            options.append(discord.SelectOption(label=label, value=did))
+
+        class RemoveSelect(discord.ui.View):
+            def __init__(self_v):
+                super().__init__(timeout=60)
+                sel = discord.ui.Select(
+                    placeholder="Choose a bot admin to remove…",
+                    options=options,
+                )
+                sel.callback = self_v._on_select
+                self_v.add_item(sel)
+
+            async def _on_select(self_v, inter: discord.Interaction):
+                did    = inter.data["values"][0]
+                member = self.guild.get_member(int(did))
+                self_v.stop()
+                await self.db.remove_bot_admin(did, self.guild_id)
+                name = member.display_name if member else f"User {did}"
+                await inter.response.edit_message(
+                    content=f"✅ **{name}** is no longer a bot admin.", view=None
+                )
+                await self._refresh()
+
+        await interaction.response.send_message(
+            "Select a bot admin to remove:", view=RemoveSelect(), ephemeral=True
+        )
+
+    async def on_timeout(self):
+        if self._message:
+            for item in self.children:
+                item.disabled = True
+            try:
+                await self._message.edit(view=self)
+            except Exception:
+                pass
 
 
 class Players(commands.Cog):
@@ -254,79 +468,28 @@ class Players(commands.Cog):
         embed = build_embed("Leaderboard", "\n".join(lines), "gold")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ── Admin: /admin_register ────────────────────────────────────────────────
+    # ── Admin: /bot_admins ────────────────────────────────────────────────────
 
-    @app_commands.command(name="admin_register", description="[Admin] Register a player manually.")
-    @app_commands.describe(member="The member to register")
+    @app_commands.command(
+        name="bot_admins",
+        description="[Admin] View, add, and remove bot admins for this server.",
+    )
     @is_admin()
-    async def admin_register(self, interaction: discord.Interaction, member: discord.Member):
-        await self.db.upsert_player(str(member.id), str(interaction.guild_id), member.display_name, [])
-        await interaction.response.send_message(
-            f"✅ {member.mention} registered with no role preferences.", ephemeral=True
+    async def bot_admins(self, interaction: discord.Interaction):
+        guild_id      = str(interaction.guild_id)
+        bot_admin_ids = await self.db.get_bot_admins(guild_id)
+
+        view = BotAdminsView(
+            db=self.db,
+            guild=interaction.guild,
+            guild_id=guild_id,
+            bot_admin_ids=bot_admin_ids,
+            invoker_id=interaction.user.id,
         )
-
-    # ── Admin: /set_weight ────────────────────────────────────────────────────
-
-    @app_commands.command(name="set_weight", description="[Admin] Set a player's power ranking weight (1-10).")
-    @app_commands.describe(member="The player", weight="Power weight 1 (weakest) to 10 (strongest)")
-    @is_admin()
-    async def set_weight(self, interaction: discord.Interaction, member: discord.Member, weight: float):
-        if not (1.0 <= weight <= 10.0):
-            await interaction.response.send_message("Weight must be between 1 and 10.", ephemeral=True)
-            return
-        player = await self.db.get_player(str(member.id), str(interaction.guild_id))
-        if not player:
-            await interaction.response.send_message(f"{member.display_name} is not registered.", ephemeral=True)
-            return
-        await self.db.update_player_weight(str(member.id), str(interaction.guild_id), weight)
         await interaction.response.send_message(
-            f"✅ Set **{member.display_name}**'s power weight to **{weight}**.", ephemeral=True
+            embed=view.build_embed(), view=view, ephemeral=True
         )
-
-    @app_commands.command(name="view_weights", description="[Admin] View all players' power weights.")
-    @is_admin()
-    async def view_weights(self, interaction: discord.Interaction):
-        players = await self.db.get_all_players(str(interaction.guild_id))
-        if not players:
-            await interaction.response.send_message("No players registered.", ephemeral=True)
-            return
-        lines = [f"**{p['display_name']}** — Weight: **{p['power_weight']}**" for p in players]
-        embed = build_embed("Power Weights (Admin Only)", "\n".join(lines), "gray")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    # ── Admin: /add_bot_admin / /remove_bot_admin ─────────────────────────────
-
-    @app_commands.command(name="add_bot_admin", description="[Admin] Grant a user bot-admin privileges.")
-    @app_commands.describe(member="The member to promote")
-    @is_admin()
-    async def add_bot_admin(self, interaction: discord.Interaction, member: discord.Member):
-        await self.db.add_bot_admin(str(member.id), str(interaction.guild_id))
-        await interaction.response.send_message(
-            f"✅ **{member.display_name}** is now a bot admin.", ephemeral=True
-        )
-
-    @app_commands.command(name="remove_bot_admin", description="[Admin] Remove a user's bot-admin privileges.")
-    @app_commands.describe(member="The member to demote")
-    @is_admin()
-    async def remove_bot_admin(self, interaction: discord.Interaction, member: discord.Member):
-        await self.db.remove_bot_admin(str(member.id), str(interaction.guild_id))
-        await interaction.response.send_message(
-            f"✅ **{member.display_name}** is no longer a bot admin.", ephemeral=True
-        )
-
-    @app_commands.command(name="list_bot_admins", description="[Admin] List all bot admins in this server.")
-    @is_admin()
-    async def list_bot_admins(self, interaction: discord.Interaction):
-        admin_ids = await self.db.get_bot_admins(str(interaction.guild_id))
-        if not admin_ids:
-            await interaction.response.send_message("No custom bot admins set.", ephemeral=True)
-            return
-        lines = []
-        for did in admin_ids:
-            member = interaction.guild.get_member(int(did))
-            lines.append(f"• {member.display_name if member else f'Unknown ({did})'}")
-        embed = build_embed("Bot Admins", "\n".join(lines), "gray")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        view._message = await interaction.original_response()
 
 
     # ── Admin: /reset_stats ────────────────────────────────────────────

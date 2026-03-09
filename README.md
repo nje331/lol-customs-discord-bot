@@ -75,21 +75,19 @@ Slash commands sync on startup and may take up to an hour to appear globally in 
 
 ## Initial Server Setup (Admin)
 
-1. **Configure voice channels** → `/configure_channels`
+1. **Configure voice channels** → `/settings` → Configure Channels button
    Set your Team 1, Team 2, Lobby voice channels, and Mod Log text channel via dropdowns.
 
 2. **Sync champion data** (required for random champ assignment) → `/update_champs`
    Pulls champion role stats from CommunityDragon for the current patch. Re-run after major patches.
 
-3. **Grant bot-admin access** (optional) → `/add_bot_admin @member`
+3. **Grant bot-admin access** (optional) → `/bot_admins` → ➕ Add Admin
    Promote trusted non-Discord-admins to run bot commands.
 
-4. **Set player weights** (optional) → `/set_weight @player 7`
-   Power weights are 1–10 and only matter if Power Rankings is enabled.
-
-5. **Toggle features** (optional) → `/toggle_setting`
-   - **Champion Weight** — when on, random champ picks are weighted by play rate
-   - **Peer Ratings** — when on, players receive a DM after each game to rate their teammates
+4. **Toggle features** (optional) → `/settings`
+   - **Champ Weight** button — when on, random champ picks are weighted by play rate
+   - **Peer Ratings** button — when on, players receive a DM after each game to rate their teammates
+   - **Rerolls** button — set how many champion rerolls each player gets per game
 
 ---
 
@@ -103,7 +101,7 @@ Anyone:
     → [View Roster] button                       confirm who's in
 
 Session Owner or Admin:
-  /make_teams [assign_roles] [random_roles] [random_champs]
+  /make_teams [assign_roles] [ignore_prefs] [random_champs]
     OR
   /start_draft                                   interactive captain snake draft
 
@@ -160,22 +158,14 @@ Session Owner or Admin:
 | `/add_player @p1 [@p2] [@p3] [@p4] [@p5]` | Add up to 5 players at once |
 | `/remove_player [member]` | Remove a player from the session |
 | `/clear_players` | Clear the entire session roster |
-| `/make_teams [assign_roles] [random_roles] [random_champs]` | Random team split with optional role/champion assignment |
+| `/make_teams [assign_roles] [ignore_prefs] [random_champs]` | Random team split with optional role/champion assignment |
 | `/start_draft` | Captain snake draft (manual or auto captain selection) |
 
 ### Admins — Server
 | Command | Description |
 |---------|-------------|
-| `/settings` | View current server settings |
-| `/configure_channels` | Set Team 1, Team 2, Lobby VCs and Mod Log text channel |
-| `/toggle_setting` | Toggle Champion Weight (play-rate weighting) or Peer Ratings on/off |
-| `/set_champ_rerolls [count]` | Set how many champion rerolls each player gets per game (0 = disabled) |
-| `/admin_register [member]` | Manually register a player with no role preferences |
-| `/set_weight [member] [1-10]` | Set a player's power ranking weight |
-| `/view_weights` | View all player power weights (ephemeral) |
-| `/add_bot_admin [member]` | Grant bot-admin privileges to a user |
-| `/remove_bot_admin [member]` | Revoke bot-admin privileges |
-| `/list_bot_admins` | List all current bot admins |
+| `/settings` | View and manage all server settings — channels, feature toggles, and reroll count all accessible via buttons |
+| `/bot_admins` | View all current admins (Discord + bot-granted), add members via dropdown, remove bot admins via dropdown |
 | `/reset_stats` | Reset all players' stats, ELOs (to 1500), and ELO history |
 
 ### Admins — Champions
@@ -216,7 +206,7 @@ Enabled **by default** when starting a session (`repeat_roles: False`). The bot 
 ### Team Formation — Random (`/make_teams`)
 Randomly splits the roster into two teams. Options:
 - `assign_roles` (default `True`) — assign lane roles, respecting preferences and avoiding repeats
-- `random_roles` (default `False`) — assign roles randomly, ignoring preferences but still avoiding repeats
+- `ignore_prefs` (default `False`) — assign roles randomly, ignoring preferences but still avoiding repeats
 - `random_champs` (default `False`) — randomly assign a champion to each player for their role
 
 ### Team Formation — Captain Draft (`/start_draft`)
@@ -286,16 +276,22 @@ Set at session start via `/start_session [auto_balance]` or changed mid-session 
 - **Mode ELO** — balances using the ELO specific to the draft mode being played
 
 ### Peer Ratings
-When enabled via `/toggle_setting`, players receive a DM after each game to rate their teammates (1–5 stars). Admins can view aggregated rating averages and engagement metrics with `/view_ratings`.
+When enabled via `/settings` (Peer Ratings toggle), players receive a DM after each game to rate their teammates (1–5 stars). Admins can view aggregated rating averages and engagement metrics with `/view_ratings`.
 
-### Power Rankings
-- Admin-only feature, **off by default**
-- Each player has a hidden weight (1–10, default 5.0), set via `/set_weight`
-- Used for team balancing independently of ELO
-- Weights are **never visible to non-admins**
+### Settings Panel (`/settings`)
+`/settings` opens an interactive panel showing all current server configuration with action buttons:
+- **Configure Channels** — opens dropdown selectors for Team 1/2 VCs, Lobby VC, and Mod Log text channel. Pre-populated with currently saved values
+- **Champ Weight** toggle — enables/disables play-rate weighting for random champion picks
+- **Peer Ratings** toggle — enables/disables post-game rating DMs
+- **Rerolls** button — opens a modal to set the per-player reroll budget (0 = disabled)
 
-### Bot Admins (Per-Server)
-Discord Admins and users with Manage Guild can always run admin commands. You can also grant bot-admin access to specific users per server with `/add_bot_admin` — useful for a dedicated "game host" role without giving them Discord server permissions.
+### Bot Admins (`/bot_admins`)
+`/bot_admins` opens an interactive panel showing:
+- **Discord Admins** — members with Administrator or Manage Guild permission (always have full access, can't be removed via bot)
+- **Bot Admins** — members explicitly granted access via the bot
+
+**➕ Add Admin** — dropdown of all eligible server members (excludes bots and existing admins)
+**➖ Remove Admin** — dropdown of only explicitly-added bot admins (Discord admins are not listed)
 
 ---
 
@@ -317,12 +313,12 @@ lol-bot/
 ├── .env.example        # Template
 ├── data/               # Created automatically — holds lol_bot.db (gitignored)
 └── cogs/
-    ├── players.py      # Registration, stats, leaderboard, bot admin management, power weights
+    ├── players.py      # Registration, stats, leaderboard, /bot_admins panel
     ├── session.py      # Session lifecycle, player roster management
     ├── teams.py        # Team formation, draft, VC moves, game results, ELO updates
     ├── champions.py    # Champion sync, custom champion management, /view_champs browser
     ├── elo.py          # ELO leaderboards and history charts
-    └── settings.py     # Channel config, feature toggles, peer ratings view, help command
+    └── settings.py     # /settings panel (channels, toggles, rerolls), peer ratings view, help command
 ```
 
 ---

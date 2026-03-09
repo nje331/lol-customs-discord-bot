@@ -1821,13 +1821,13 @@ class Teams(commands.Cog):
     @app_commands.command(name="make_teams", description="Split session players into two teams of 5. Extras sit out.")
     @app_commands.describe(
         assign_roles="Assign roles to players (default: True)",
-        random_roles="Ignore role preferences — assign roles randomly but still avoid repeats (default: False)",
+        ignore_prefs="Ignore role preferences — assign roles randomly but still avoid repeats (default: False)",
         random_champs="Randomly assign a champion to each player (default: False)",
     )
     @is_session_owner()
     async def make_teams(self, interaction: discord.Interaction,
                           assign_roles: bool = True,
-                          random_roles: bool = False,
+                          ignore_prefs: bool = False,
                           random_champs: bool = False):
         guild_id = str(interaction.guild_id)
         session = await self.db.get_active_session(guild_id)
@@ -1845,7 +1845,7 @@ class Teams(commands.Cog):
         await interaction.response.defer()
         await self._finalize_teams(
             interaction, session["id"], players, settings,
-            assign_roles=assign_roles, use_prefs=not random_roles,
+            assign_roles=assign_roles, use_prefs=not ignore_prefs,
             random_champs=random_champs, use_power=False, send_mode="followup"
         )
 
