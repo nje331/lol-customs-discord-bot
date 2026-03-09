@@ -4,11 +4,8 @@ Syncs League of Legends champion role statistics from CommunityDragon.
 Run /update_champs once to populate the DB; data is used by /make_teams random_champs:True.
 
 Custom champion commands (bot-admin only):
-  /add_custom_champ    — add a champion/role entry that persists across patch syncs
-  /remove_custom_champ — remove a custom entry by name + role
   /clear_custom_champs — remove ALL custom entries for this server
-  /view_champs         — paginated role browser showing synced + custom entries,
-                         with inline Add / Remove buttons
+  /view_champs         — paginated role browser; Add (modal) and Remove (dropdown) inline
 """
 
 import discord
@@ -47,6 +44,9 @@ ROLE_CHOICES = {
 # Max synced champs shown per page in /view_champs
 PAGE_SIZE = 20
 
+# Discord Select menus cap at 25 options
+SELECT_MAX = 25
+
 
 # ── Embed builder ─────────────────────────────────────────────────────────────
 
@@ -61,7 +61,7 @@ def _build_role_embed(
     embed = build_embed(f"Champion Pool — {label}", color_key="gold")
 
     # Synced (paginated)
-    start      = page * PAGE_SIZE
+    start       = page * PAGE_SIZE
     page_champs = synced[start : start + PAGE_SIZE]
     if page_champs:
         lines = []
@@ -95,7 +95,7 @@ def _build_role_embed(
     return embed
 
 
-# ── Modals ────────────────────────────────────────────────────────────────────
+# ── Add modal ─────────────────────────────────────────────────────────────────
 
 class AddChampModal(discord.ui.Modal, title="Add Custom Champion"):
     champ_name = discord.ui.TextInput(
@@ -114,8 +114,8 @@ class AddChampModal(discord.ui.Modal, title="Add Custom Champion"):
         self.refresh_cb = refresh_cb
 
     async def on_submit(self, interaction: discord.Interaction):
-        name = self.champ_name.value.strip()
-        ok   = await self.db.add_custom_champion(
+        name       = self.champ_name.value.strip()
+        ok         = await self.db.add_custom_champion(
             self.guild_id, name, self.role, self.added_by
         )
         role_label = ROLE_LABELS.get(self.role, self.role)
@@ -132,36 +132,63 @@ class AddChampModal(discord.ui.Modal, title="Add Custom Champion"):
         await self.refresh_cb()
 
 
-class RemoveChampModal(discord.ui.Modal, title="Remove Custom Champion"):
-    champ_name = discord.ui.TextInput(
-        label="Champion Name (exact, case-insensitive)",
-        placeholder="e.g. Yasuo",
-        min_length=1,
-        max_length=50,
-    )
+# ── Remove dropdown view ──────────────────────────────────────────────────────
 
-    def __init__(self, role: str, db, guild_id: str, refresh_cb):
-        super().__init__()
+class RemoveChampSelectView(discord.ui.View):
+    """
+    Ephemeral follow-up view with a Select containing all custom champions for
+    the current role. Selecting one removes it and refreshes the browser.
+    """
+
+    def __init__(self, role: str, custom: list[dict], db, guild_id: str, refresh_cb):
+        super().__init__(timeout=60)
         self.role       = role
         self.db         = db
         self.guild_id   = guild_id
         self.refresh_cb = refresh_cb
 
-    async def on_submit(self, interaction: discord.Interaction):
-        name       = self.champ_name.value.strip()
+        # Truncate to Discord's 25-option limit
+        options = [
+            discord.SelectOption(label=c["name"], value=c["name"])
+            for c in custom[:SELECT_MAX]
+        ]
+        overflow_note = (
+            f"\n_(Showing first {SELECT_MAX} of {len(custom)} — remove some to see more)_"
+            if len(custom) > SELECT_MAX else ""
+        )
+        self._overflow_note = overflow_note
+
+        select = discord.ui.Select(
+            placeholder="Choose a champion to remove…",
+            options=options,
+        )
+        select.callback = self._on_select
+        self.add_item(select)
+
+        cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
+        cancel.callback = self._on_cancel
+        self.add_item(cancel)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        name       = interaction.data["values"][0]
         ok         = await self.db.remove_custom_champion(self.guild_id, name, self.role)
         role_label = ROLE_LABELS.get(self.role, self.role)
+        self.stop()
         if ok:
-            await interaction.response.send_message(
-                f"✅ **{name}** removed from custom **{role_label}** champions.",
-                ephemeral=True,
+            await interaction.response.edit_message(
+                content=f"✅ **{name}** removed from custom **{role_label}** champions.",
+                view=None,
             )
         else:
-            await interaction.response.send_message(
-                f"⚠️ No custom champion named **{name}** found for **{role_label}**.",
-                ephemeral=True,
+            await interaction.response.edit_message(
+                content=f"⚠️ Could not remove **{name}** — it may have already been deleted.",
+                view=None,
             )
         await self.refresh_cb()
+
+    async def _on_cancel(self, interaction: discord.Interaction):
+        self.stop()
+        await interaction.response.edit_message(content="Cancelled.", view=None)
 
 
 # ── Paginated browser view ────────────────────────────────────────────────────
@@ -189,8 +216,8 @@ class ChampBrowserView(discord.ui.View):
     # ── data ─────────────────────────────────────────────────────────────────
 
     async def load(self):
-        role   = ROLE_ORDER[self.role_idx]
-        data   = await self.db.get_all_champions_for_role(self.guild_id, role)
+        role         = ROLE_ORDER[self.role_idx]
+        data         = await self.db.get_all_champions_for_role(self.guild_id, role)
         self._synced = data["synced"]
         self._custom = data["custom"]
 
@@ -261,7 +288,7 @@ class ChampBrowserView(discord.ui.View):
         rm_btn.callback = self._remove_custom
         self.add_item(rm_btn)
 
-    # ── guard ─────────────────────────────────────────────────────────────────
+    # ── interaction guard ─────────────────────────────────────────────────────
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.invoker_id:
@@ -329,13 +356,20 @@ class ChampBrowserView(discord.ui.View):
                 except Exception:
                     pass
 
-        await interaction.response.send_modal(
-            RemoveChampModal(
-                role=role,
-                db=self.db,
-                guild_id=self.guild_id,
-                refresh_cb=refresh,
-            )
+        # Send an ephemeral follow-up with the dropdown — don't edit the main browser
+        select_view = RemoveChampSelectView(
+            role=role,
+            custom=self._custom,
+            db=self.db,
+            guild_id=self.guild_id,
+            refresh_cb=refresh,
+        )
+        role_label = ROLE_LABELS.get(role, role)
+        overflow = select_view._overflow_note
+        await interaction.response.send_message(
+            f"Select a **{role_label}** custom champion to remove:{overflow}",
+            view=select_view,
+            ephemeral=True,
         )
 
     async def on_timeout(self):
@@ -383,78 +417,6 @@ class Champions(commands.Cog):
             f"_Custom champions are unaffected._",
             ephemeral=True,
         )
-
-    # ── /add_custom_champ ─────────────────────────────────────────────────────
-
-    @app_commands.command(
-        name="add_custom_champ",
-        description="[Admin] Add a custom champion to a role pool. Persists across patch syncs."
-    )
-    @app_commands.describe(
-        name="Champion name (e.g. Yasuo)",
-        role="Role to assign this champion to",
-    )
-    @app_commands.choices(role=[
-        app_commands.Choice(name=label, value=db_key)
-        for label, db_key in ROLE_CHOICES.items()
-    ])
-    @is_admin()
-    async def add_custom_champ(
-        self,
-        interaction: discord.Interaction,
-        name: str,
-        role: str,
-    ):
-        ok         = await self.db.add_custom_champion(
-            str(interaction.guild_id), name, role, str(interaction.user.id)
-        )
-        role_label = ROLE_LABELS.get(role, role)
-        if ok:
-            await interaction.response.send_message(
-                f"✅ **{name}** added as a custom **{role_label}** champion.",
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                f"⚠️ **{name}** is already in the custom list for **{role_label}**.",
-                ephemeral=True,
-            )
-
-    # ── /remove_custom_champ ──────────────────────────────────────────────────
-
-    @app_commands.command(
-        name="remove_custom_champ",
-        description="[Admin] Remove a custom champion from a role pool."
-    )
-    @app_commands.describe(
-        name="Champion name (case-insensitive)",
-        role="Role the champion was assigned to",
-    )
-    @app_commands.choices(role=[
-        app_commands.Choice(name=label, value=db_key)
-        for label, db_key in ROLE_CHOICES.items()
-    ])
-    @is_admin()
-    async def remove_custom_champ(
-        self,
-        interaction: discord.Interaction,
-        name: str,
-        role: str,
-    ):
-        ok         = await self.db.remove_custom_champion(
-            str(interaction.guild_id), name, role
-        )
-        role_label = ROLE_LABELS.get(role, role)
-        if ok:
-            await interaction.response.send_message(
-                f"✅ **{name}** removed from custom **{role_label}** champions.",
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                f"⚠️ No custom champion named **{name}** found for **{role_label}**.",
-                ephemeral=True,
-            )
 
     # ── /clear_custom_champs ──────────────────────────────────────────────────
 
@@ -536,8 +498,8 @@ class Champions(commands.Cog):
                     "Could not find JSON.parse(...) in champion statistics JS. "
                     "CommunityDragon may have changed the file format."
                 )
-            raw_json    = match.group(1).replace("\\'", "'")
-            stats_data  = json.loads(raw_json)
+            raw_json   = match.group(1).replace("\\'", "'")
+            stats_data = json.loads(raw_json)
 
             summary_url = (
                 "https://raw.communitydragon.org/latest/plugins/"
@@ -554,7 +516,7 @@ class Champions(commands.Cog):
         }
 
         updated_count = 0
-        await self.db.clear_champions()          # only wipes synced table; custom_champions untouched
+        await self.db.clear_champions()  # only wipes synced table; custom_champions untouched
         for raw_role, champs in stats_data.items():
             role_key = raw_role.upper()
             if role_key not in VALID_ROLES:

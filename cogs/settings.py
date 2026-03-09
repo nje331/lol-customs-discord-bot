@@ -305,9 +305,7 @@ class Settings(commands.Cog):
 
             embed.add_field(name="🔧 Admin — Champions", value=(
                 "`/update_champs` — Sync champion data from CommunityDragon for the current patch\n"
-                "`/view_champs [role]` — Browse champion pools by role; add/remove custom champions inline\n"
-                "`/add_custom_champ [name] [role]` — Add a custom champion to a role pool\n"
-                "`/remove_custom_champ [name] [role]` — Remove a custom champion\n"
+                "`/view_champs [role]` — Browse champion pools by role; add custom champions (modal) and remove them (dropdown) inline\n"
                 "`/clear_custom_champs` — Remove all custom champion entries for this server"
             ), inline=False)
 
