@@ -164,8 +164,8 @@ Session Owner or Admin:
 | `/admins` | View, add, and remove bot admins |
 | `/players` | List all registered players and their role preferences |
 | `/update_champs` | Sync champion role stats from CommunityDragon for the current patch |
-| `/view_champs [role]` | Paginated role browser; add (modal) and remove (dropdown) custom champions |
-| `/clear_custom_champs` | Remove all custom champion entries for this server |
+| `/champs [role]` | Paginated role browser; add, remove, and clear all custom champions via buttons |
+| 
 | `/view_elo [type]` | View ELO leaderboard for any of the 7 tracked modes |
 | `/elo_history [type] [member]` | View an ELO history chart |
 | `/view_ratings` | View peer rating averages and engagement metrics for all players |
@@ -224,9 +224,9 @@ When `random_champs:True` is passed to `/make_teams`, each player is assigned a 
 ### Custom Champions
 Bot admins can maintain a per-server list of custom champion entries that supplement the CommunityDragon patch data and persist across `/update_champs` syncs:
 
-- `/view_champs [role]` — full paginated browser (Top → Support) with inline **➕ Add Custom** and **➖ Remove Custom** buttons
+- `/champs [role]` — full paginated browser with **➕ Add Custom**, **➖ Remove Custom**, and **🗑️ Clear All Custom** buttons
 - `/add_custom_champ` / `/remove_custom_champ` — quick slash-command alternatives
-- `/clear_custom_champs` — wipe all custom entries for the server
+- 
 - Custom champions are included in the random pool alongside synced data
 
 ### Voice Channel Automation
@@ -303,7 +303,7 @@ lol-bot/
     ├── players.py      # Registration, stats, leaderboard, /admins panel
     ├── session.py      # Session lifecycle, player roster management
     ├── teams.py        # Team formation, draft, VC moves, game results, ELO updates
-    ├── champions.py    # Champion sync, custom champion management, /view_champs browser
+    ├── champions.py    # Champion sync, custom champion management, /champs browser
     ├── elo.py          # ELO leaderboards and history charts
     └── settings.py     # /settings panel (channels, toggles, rerolls), peer ratings view, help command
 ```

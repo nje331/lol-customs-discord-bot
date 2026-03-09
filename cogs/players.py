@@ -227,7 +227,7 @@ class AdminsView(discord.ui.View):
             return False
         return True
 
-    async def _refresh(self):
+    async def _update_panel(self):
         self.bot_admin_ids = await self.db.get_bot_admins(self.guild_id)
         self._rebuild()
         if self._message:
@@ -277,7 +277,7 @@ class AdminsView(discord.ui.View):
                 await inter.response.edit_message(
                     content=f"✅ **{name}** is now a bot admin.", view=None
                 )
-                await self._refresh()
+                await self._update_panel()
 
         await interaction.response.send_message(
             "Select a member to grant bot admin:", view=AddSelect(), ephemeral=True
@@ -317,7 +317,7 @@ class AdminsView(discord.ui.View):
                 await inter.response.edit_message(
                     content=f"✅ **{name}** is no longer a bot admin.", view=None
                 )
-                await self._refresh()
+                await self._update_panel()
 
         await interaction.response.send_message(
             "Select a bot admin to remove:", view=RemoveSelect(), ephemeral=True

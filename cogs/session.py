@@ -339,7 +339,7 @@ class SessionView(discord.ui.View):
             return False
         return True
 
-    async def _refresh(self, interaction: discord.Interaction):
+    async def _update_panel(self, interaction: discord.Interaction):
         self.session = await self.db.get_active_session(self.guild_id) or self.session
         self.players = await self.db.get_session_players(self.session["id"], self.guild_id)
         self._rebuild()
@@ -350,7 +350,7 @@ class SessionView(discord.ui.View):
         new_val = 0 if current else 1
         await self.db.update_session(self.session["id"], repeat_roles=new_val)
         self.session["repeat_roles"] = new_val
-        await self._refresh(interaction)
+        await self._update_panel(interaction)
 
     async def _cycle_auto_balance(self, interaction: discord.Interaction):
         current = self.session.get("auto_balance", "off")
@@ -358,7 +358,7 @@ class SessionView(discord.ui.View):
         nxt     = self._AB_CYCLE[(idx + 1) % len(self._AB_CYCLE)]
         await self.db.update_session(self.session["id"], auto_balance=nxt)
         self.session["auto_balance"] = nxt
-        await self._refresh(interaction)
+        await self._update_panel(interaction)
 
     async def _clear_roster(self, interaction: discord.Interaction):
         db      = self.db

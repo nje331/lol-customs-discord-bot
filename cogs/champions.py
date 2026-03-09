@@ -4,8 +4,8 @@ Syncs League of Legends champion role statistics from CommunityDragon.
 Run /update_champs once to populate the DB; data is used by /make_teams random_champs:True.
 
 Custom champion commands (bot-admin only):
-  /clear_custom_champs — remove ALL custom entries for this server
-  /view_champs         — paginated role browser; Add (modal) and Remove (dropdown) inline
+  
+  /champs              — paginated role browser; Add, Remove, Clear custom buttons; Add (modal) and Remove (dropdown) inline
 """
 
 import discord
@@ -288,6 +288,15 @@ class ChampBrowserView(discord.ui.View):
         rm_btn.callback = self._remove_custom
         self.add_item(rm_btn)
 
+        clear_btn = discord.ui.Button(
+            label="🗑️ Clear All Custom",
+            style=discord.ButtonStyle.danger,
+            disabled=(len(self._custom) == 0),
+            row=2,
+        )
+        clear_btn.callback = self._clear_all_custom
+        self.add_item(clear_btn)
+
     # ── interaction guard ─────────────────────────────────────────────────────
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -372,6 +381,40 @@ class ChampBrowserView(discord.ui.View):
             ephemeral=True,
         )
 
+    async def _clear_all_custom(self, interaction: discord.Interaction):
+        guild_id = self.guild_id
+        db       = self.db
+
+        async def do_refresh():
+            await self.load()
+            self._rebuild_buttons()
+            if self._message:
+                try:
+                    await self._message.edit(embed=self._build_embed(), view=self)
+                except Exception:
+                    pass
+
+        class ConfirmClear(discord.ui.View):
+            def __init__(self_v):
+                super().__init__(timeout=30)
+
+            @discord.ui.button(label="Yes, clear all", style=discord.ButtonStyle.danger)
+            async def confirm(self_v, btn_inter: discord.Interaction, btn: discord.ui.Button):
+                self_v.stop()
+                count = await db.clear_custom_champions(guild_id)
+                label = f"🗑️ Cleared **{count}** custom entr{'y' if count == 1 else 'ies'}." if count else "ℹ️ No custom champions to clear."
+                await btn_inter.response.edit_message(content=label, view=None)
+                await do_refresh()
+
+            @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+            async def cancel(self_v, btn_inter: discord.Interaction, btn: discord.ui.Button):
+                self_v.stop()
+                await btn_inter.response.edit_message(content="Cancelled.", view=None)
+
+        await interaction.response.send_message(
+            "Remove **all** custom champions for this server?", view=ConfirmClear(), ephemeral=True
+        )
+
     async def on_timeout(self):
         if self._message:
             for item in self.children:
@@ -418,31 +461,11 @@ class Champions(commands.Cog):
             ephemeral=True,
         )
 
-    # ── /clear_custom_champs ──────────────────────────────────────────────────
+    # ── /champs ───────────────────────────────────────────────────────────────
 
     @app_commands.command(
-        name="clear_custom_champs",
-        description="[Admin] Remove ALL custom champion entries for this server."
-    )
-    @is_admin()
-    async def clear_custom_champs(self, interaction: discord.Interaction):
-        count = await self.db.clear_custom_champions(str(interaction.guild_id))
-        if count:
-            await interaction.response.send_message(
-                f"🗑️ Cleared **{count}** custom champion entr{'y' if count == 1 else 'ies'}.",
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                "ℹ️ No custom champions to clear.",
-                ephemeral=True,
-            )
-
-    # ── /view_champs ──────────────────────────────────────────────────────────
-
-    @app_commands.command(
-        name="view_champs",
-        description="[Admin] Browse champion pools by role, with Add / Remove custom buttons."
+        name="champs",
+        description="[Admin] Browse champion pools by role, with Add / Remove / Clear custom buttons."
     )
     @app_commands.describe(role="Jump directly to a role (default: Top)")
     @app_commands.choices(role=[
@@ -450,7 +473,7 @@ class Champions(commands.Cog):
         for label, db_key in ROLE_CHOICES.items()
     ])
     @is_admin()
-    async def view_champs(
+    async def champs(
         self,
         interaction: discord.Interaction,
         role: str = "TOP",

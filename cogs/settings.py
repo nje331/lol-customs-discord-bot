@@ -202,7 +202,7 @@ class SettingsPanelView(discord.ui.View):
             return False
         return True
 
-    async def _refresh(self):
+    async def _update_panel(self):
         self.settings = await self.db.get_settings(self.guild_id)
         self._rebuild()
         if self._message:
@@ -269,13 +269,13 @@ class SettingsPanelView(discord.ui.View):
     async def _toggle_champ_weight(self, interaction: discord.Interaction):
         current = bool(self.settings.get("champ_weight_enabled"))
         await self.db.update_setting(self.guild_id, "champ_weight_enabled", 0 if current else 1)
-        await self._refresh()
+        await self._update_panel()
         await interaction.response.defer()
 
     async def _toggle_peer_ratings(self, interaction: discord.Interaction):
         current = bool(self.settings.get("peer_ratings_enabled"))
         await self.db.update_setting(self.guild_id, "peer_ratings_enabled", 0 if current else 1)
-        await self._refresh()
+        await self._update_panel()
         await interaction.response.defer()
 
     async def _set_rerolls(self, interaction: discord.Interaction):
@@ -283,7 +283,7 @@ class SettingsPanelView(discord.ui.View):
             RerollCountModal(
                 db=self.db,
                 guild_id=self.guild_id,
-                refresh_cb=self._refresh,
+                refresh_cb=self._update_panel,
             )
         )
 
@@ -409,7 +409,7 @@ class Settings(commands.Cog):
         is_admin_user = await check_is_admin(interaction)
         is_owner      = await check_is_session_owner(interaction)
 
-        embed = build_embed("LoL Custom Game Bot — Commands", color_key="gold")
+        embed = build_embed("LoL Custom Game Bot", color_key="gold")
 
         embed.add_field(name="👤 Everyone", value=(
             "`/register` — register & set your role preferences\n"
@@ -436,8 +436,7 @@ class Settings(commands.Cog):
                 "`/admins` — manage bot admins\n"
                 "`/players` — registered players and role preferences\n"
                 "`/update_champs` — sync champion data from the current patch\n"
-                "`/view_champs [role]` — browse and edit champion pools\n"
-                "`/clear_custom_champs` — remove all custom champions\n"
+                "`/champs [role]` — browse and edit champion pools\n"
                 "`/view_elo [type]` — ELO leaderboard\n"
                 "`/elo_history [type] [member]` — ELO history chart\n"
                 "`/view_ratings` — peer rating scores and engagement\n"
