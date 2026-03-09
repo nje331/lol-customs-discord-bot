@@ -440,7 +440,7 @@ class Settings(commands.Cog):
                 "`/clear_custom_champs` — remove all custom champions\n"
                 "`/view_elo [type]` — ELO leaderboard\n"
                 "`/elo_history [type] [member]` — ELO history chart\n"
-                "`/view_ratings` — peer rating scores and engagement"
+                "`/view_ratings` — peer rating scores and engagement\n"
                 "`/reset_stats` — wipe all stats and ELO history"
             ), inline=False)
 
