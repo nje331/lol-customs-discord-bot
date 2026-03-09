@@ -413,7 +413,8 @@ class StartGameView(discord.ui.View):
                  session_players: list,   # full session roster incl. bench
                  elo_type: str = "total",
                  cog=None):
-        super().__init__(timeout=None)
+        super().__init__(timeout=600)
+        self._message: discord.Message = None
         self.session_id = session_id
         self.team1 = team1
         self.team2 = team2
@@ -786,6 +787,20 @@ class StartGameView(discord.ui.View):
         except Exception:
             pass  # Never block the game from starting
 
+    async def on_timeout(self):
+        """Teams preview timed out without being started — mark the embed as expired."""
+        if not hasattr(self, "_message") or self._message is None:
+            return
+        try:
+            embed = build_embed(
+                f"Game #{self.game_num} — Teams Expired",
+                "⏰ Nobody started this game in time. Use `/make_teams` or `/start_draft` to generate new teams.",
+                "gray",
+            )
+            await self._message.edit(embed=embed, view=None)
+        except Exception:
+            pass
+
     @discord.ui.button(label="🎲 Re-roll Teams", style=discord.ButtonStyle.secondary, row=1)
     async def reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
         from utils import check_is_session_owner, check_is_admin
@@ -1142,6 +1157,7 @@ class InProgressView(discord.ui.View):
         await self._send_rating_dms(interaction)
 
         await interaction.message.edit(embed=embed, view=next_view)
+        next_view._message = interaction.message
 
     async def _post_reroll_summary(self, interaction: discord.Interaction):
         """Post a per-player reroll summary to the mod channel after the game ends."""
@@ -1279,7 +1295,7 @@ class NextGameView(discord.ui.View):
 
     def __init__(self, session_id: int, settings: dict, session_players: list,
                  team1: list, team2: list, bench: list, cog):
-        super().__init__(timeout=None)
+        super().__init__(timeout=600)
         self.session_id = session_id
         self.settings = settings
         self.session_players = session_players  # full roster
@@ -1287,6 +1303,7 @@ class NextGameView(discord.ui.View):
         self.team2 = team2
         self.bench = bench
         self.cog = cog
+        self._message: discord.Message = None
 
     # Row 0: preference-based role options
     @discord.ui.button(label="Roles (Pref)", style=discord.ButtonStyle.primary, emoji="🎲", row=0)
@@ -1351,6 +1368,21 @@ class NextGameView(discord.ui.View):
             use_power=False, send_mode="followup"
         )
 
+    async def on_timeout(self):
+        """Post-match menu timed out — tell the channel the session stalled."""
+        if not self._message:
+            return
+        try:
+            embed = build_embed(
+                "Session Stalled",
+                "⏰ No new game was started. Use `/make_teams` or `/start_draft` to continue, "
+                "or `/end_session` to wrap up.",
+                "gray",
+            )
+            await self._message.edit(embed=embed, view=None)
+        except Exception:
+            pass
+
     # Row 2: draft
     @discord.ui.button(label="Captain Draft", style=discord.ButtonStyle.success, emoji="🎯", row=2)
     async def captain_draft(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1371,6 +1403,7 @@ class NextGameView(discord.ui.View):
             past_captain_ids=past_captains
         )
         await interaction.response.edit_message(embed=view._get_embed(), view=view)
+        view._message = interaction.message
 
 
 class CaptainDraftView(discord.ui.View):
@@ -1654,6 +1687,21 @@ class CaptainDraftView(discord.ui.View):
             await interaction.message.edit(embed=self._get_embed(), view=None)
             await self._finish(interaction)
 
+    async def on_timeout(self):
+        """Draft timed out — update the embed so people know it expired."""
+        try:
+            msg = getattr(self, "_message", None)
+            if msg is None:
+                return
+            embed = build_embed(
+                "Draft Expired",
+                "⏰ The captain draft timed out. Use `/start_draft` or `/make_teams` to start a new one.",
+                "gray",
+            )
+            await msg.edit(embed=embed, view=None)
+        except Exception:
+            pass
+
     async def _finish(self, interaction: discord.Interaction):
         """Draft complete — bench the leftover pool and hand off to _finalize_teams."""
         guild_id = str(interaction.guild_id)
@@ -1811,10 +1859,13 @@ class Teams(commands.Cog):
 
         if send_mode == "send":
             await interaction.response.send_message(embed=embed, view=start_view)
+            start_view._message = await interaction.original_response()
         elif send_mode == "followup":
-            await interaction.followup.send(embed=embed, view=start_view)
+            msg = await interaction.followup.send(embed=embed, view=start_view)
+            start_view._message = msg
         elif send_mode == "message_edit":
             await interaction.message.edit(embed=embed, view=start_view)
+            start_view._message = interaction.message
 
     # ── /make_teams ────────────────────────────────────────────────────────────
 
@@ -1883,6 +1934,7 @@ class Teams(commands.Cog):
             past_captain_ids=past_captains,
         )
         await interaction.response.send_message(embed=view._get_embed(), view=view)
+        view._message = await interaction.original_response()
 
 
 async def setup(bot: commands.Bot):

@@ -24,6 +24,7 @@ class CreateGameView(discord.ui.View):
         self.settings = settings
         self.db = db
         self.teams_cog = teams_cog
+        self._message: discord.Message = None
 
     def build_embed(self) -> discord.Embed:
         from utils import build_embed as _be
@@ -32,6 +33,18 @@ class CreateGameView(discord.ui.View):
             f"**{len(self.players)} players** in session. Pick a format to generate teams.",
             "blue"
         )
+
+    async def on_timeout(self):
+        if not self._message:
+            return
+        try:
+            embed = discord.Embed(
+                description="⏰ Game format selection timed out. Press **Create Game** again to retry.",
+                colour=0x95A5A6,
+            )
+            await self._message.edit(embed=embed, view=None)
+        except Exception:
+            pass
 
     async def _make(self, interaction: discord.Interaction,
                     assign_roles: bool, use_prefs: bool, random_champs: bool):
@@ -86,13 +99,7 @@ class CreateGameView(discord.ui.View):
             past_captain_ids=past_captains,
         )
         await interaction.response.send_message(embed=view._get_embed(), view=view)
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="✖️", row=2)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.stop()
-        await interaction.response.edit_message(
-            embed=discord.Embed(description="Cancelled.", colour=0x808080), view=None
-        )
+        view._message = await interaction.original_response()
 
 
 class SessionControlView(discord.ui.View):
@@ -219,6 +226,7 @@ class SessionControlView(discord.ui.View):
         await interaction.response.send_message(
             embed=view.build_embed(), view=view
         )
+        view._message = await interaction.original_response()
 
     @discord.ui.button(label="End Session", style=discord.ButtonStyle.danger, emoji="🛑", row=1)
     async def end_session_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -232,6 +240,10 @@ class SessionControlView(discord.ui.View):
         class ConfirmEnd(discord.ui.View):
             def __init__(self_v):
                 super().__init__(timeout=30)
+
+            async def on_timeout(self_v):
+                # ephemeral message — can't edit after timeout, so just stop
+                pass
 
             @discord.ui.button(label="Yes, end it", style=discord.ButtonStyle.danger)
             async def yes(self_v, btn_inter: discord.Interaction, btn: discord.ui.Button):
@@ -441,6 +453,9 @@ class Session(commands.Cog):
             class ConfirmView(discord.ui.View):
                 def __init__(self_v):
                     super().__init__(timeout=30)
+
+                async def on_timeout(self_v):
+                    pass  # ephemeral — cannot edit without stored webhook
 
                 @discord.ui.button(label="End old & start new", style=discord.ButtonStyle.danger)
                 async def confirm(self_v, btn_inter: discord.Interaction, button: discord.ui.Button):

@@ -27,7 +27,19 @@ class RoleSelectView(discord.ui.View):
         self.callback = callback
         self.selected: list[str] = []
         self.existing = existing or []
+        self._message: discord.Message = None
         self._rebuild()
+
+    async def on_timeout(self):
+        if not self._message:
+            return
+        try:
+            await self._message.edit(
+                content="⏰ Role selection timed out. Run the command again to set your preferences.",
+                view=None,
+            )
+        except Exception:
+            pass
 
     def _rebuild(self):
         self.clear_items()
@@ -367,6 +379,7 @@ class Players(commands.Cog):
         )
         msg = "Update your role preferences:" if existing else "Welcome! Set your role preferences (priority order):"
         await interaction.response.send_message(msg, view=view, ephemeral=True)
+        view._message = await interaction.original_response()
 
     # ── /register ────────────────────────────────────────────────────────────
 
