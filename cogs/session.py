@@ -251,6 +251,159 @@ class SessionControlView(discord.ui.View):
         )
 
 
+class SessionView(discord.ui.View):
+    """
+    Shown by /session. Displays roster + session settings in one panel.
+    Session owners/admins get toggle buttons for repeat_roles and auto_balance,
+    plus a Clear Roster button.
+    """
+
+    _AB_CYCLE  = ["off", "total", "mode"]
+    _AB_LABELS = {"off": "Balance: Off", "total": "Balance: Total ELO", "mode": "Balance: Mode ELO"}
+
+    def __init__(self, session: dict, players: list, db,
+                 guild_id: str, invoker_id: int, is_owner: bool):
+        super().__init__(timeout=180)
+        self.session    = session
+        self.players    = players
+        self.db         = db
+        self.guild_id   = guild_id
+        self.invoker_id = invoker_id
+        self.is_owner   = is_owner
+        self._message: discord.Message = None
+        self._rebuild()
+
+    # ── embed ─────────────────────────────────────────────────────────────────
+
+    def build_embed(self) -> discord.Embed:
+        rr = bool(self.session.get("repeat_roles", 0))
+        ab = self.session.get("auto_balance", "off")
+        ab_text = {"off": "Off", "total": "Total ELO", "mode": "Mode ELO"}.get(ab, ab)
+
+        header = (
+            f"{'✅' if rr else '❌'} Repeat Roles  ·  "
+            f"⚖️ Balance: {ab_text}\n\n"
+        )
+        if self.players:
+            roster = "\n".join(fmt_player(p, show_stats=False) for p in self.players)
+        else:
+            roster = "_No players yet._"
+
+        return build_embed(
+            f"Session #{self.session['id']} — {len(self.players)} player{'s' if len(self.players) != 1 else ''}",
+            header + roster,
+            color_key="blue",
+        )
+
+    # ── buttons (owner/admin only) ────────────────────────────────────────────
+
+    def _rebuild(self):
+        self.clear_items()
+        if not self.is_owner:
+            return
+
+        rr     = bool(self.session.get("repeat_roles", 0))
+        rr_btn = discord.ui.Button(
+            label=f"Repeat Roles: {'ON' if rr else 'OFF'}",
+            style=discord.ButtonStyle.success if rr else discord.ButtonStyle.secondary,
+            row=0,
+        )
+        rr_btn.callback = self._toggle_repeat_roles
+        self.add_item(rr_btn)
+
+        ab     = self.session.get("auto_balance", "off")
+        ab_btn = discord.ui.Button(
+            label=self._AB_LABELS.get(ab, ab),
+            style=discord.ButtonStyle.primary if ab != "off" else discord.ButtonStyle.secondary,
+            emoji="⚖️",
+            row=0,
+        )
+        ab_btn.callback = self._cycle_auto_balance
+        self.add_item(ab_btn)
+
+        clear_btn = discord.ui.Button(
+            label="Clear Roster",
+            style=discord.ButtonStyle.danger,
+            emoji="🗑️",
+            disabled=(len(self.players) == 0),
+            row=0,
+        )
+        clear_btn.callback = self._clear_roster
+        self.add_item(clear_btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "Only the person who opened this can use these buttons.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction):
+        self.session = await self.db.get_active_session(self.guild_id) or self.session
+        self.players = await self.db.get_session_players(self.session["id"], self.guild_id)
+        self._rebuild()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _toggle_repeat_roles(self, interaction: discord.Interaction):
+        current = bool(self.session.get("repeat_roles", 0))
+        new_val = 0 if current else 1
+        await self.db.update_session(self.session["id"], repeat_roles=new_val)
+        self.session["repeat_roles"] = new_val
+        await self._refresh(interaction)
+
+    async def _cycle_auto_balance(self, interaction: discord.Interaction):
+        current = self.session.get("auto_balance", "off")
+        idx     = self._AB_CYCLE.index(current) if current in self._AB_CYCLE else 0
+        nxt     = self._AB_CYCLE[(idx + 1) % len(self._AB_CYCLE)]
+        await self.db.update_session(self.session["id"], auto_balance=nxt)
+        self.session["auto_balance"] = nxt
+        await self._refresh(interaction)
+
+    async def _clear_roster(self, interaction: discord.Interaction):
+        db      = self.db
+        session = self.session
+
+        class ConfirmClear(discord.ui.View):
+            def __init__(self_v):
+                super().__init__(timeout=30)
+
+            @discord.ui.button(label="Yes, clear", style=discord.ButtonStyle.danger)
+            async def confirm(self_v, btn_inter: discord.Interaction, btn: discord.ui.Button):
+                self_v.stop()
+                await db.db.execute(
+                    "DELETE FROM session_players WHERE session_id=?", (session["id"],)
+                )
+                await db.db.commit()
+                await btn_inter.response.edit_message(content="✅ Roster cleared.", view=None)
+                # Refresh the parent panel
+                self.players = []
+                self._rebuild()
+                if self._message:
+                    try:
+                        await self._message.edit(embed=self.build_embed(), view=self)
+                    except Exception:
+                        pass
+
+            @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+            async def cancel(self_v, btn_inter: discord.Interaction, btn: discord.ui.Button):
+                self_v.stop()
+                await btn_inter.response.edit_message(content="Cancelled.", view=None)
+
+        await interaction.response.send_message(
+            "Remove all players from the roster?", view=ConfirmClear(), ephemeral=True
+        )
+
+    async def on_timeout(self):
+        if self._message:
+            for item in self.children:
+                item.disabled = True
+            try:
+                await self._message.edit(view=self)
+            except Exception:
+                pass
+
+
 class Session(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -467,124 +620,31 @@ class Session(commands.Cog):
             f"✅ Removed **{member.display_name}** from the session.", ephemeral=True
         )
 
-    # ── /session_players ──────────────────────────────────────────────────────
+    # ── /session ──────────────────────────────────────────────────────────────
 
-    @app_commands.command(name="session_players", description="Show all players in the current session.")
-    async def session_players(self, interaction: discord.Interaction):
+    @app_commands.command(name="session", description="View the current roster and session settings.")
+    async def session_cmd(self, interaction: discord.Interaction):
         guild_id = str(interaction.guild_id)
-        session = await self.db.get_active_session(guild_id)
+        session  = await self.db.get_active_session(guild_id)
         if not session:
             await interaction.response.send_message("No active session.", ephemeral=True)
             return
 
-        players = await self.db.get_session_players(session["id"], guild_id)
-        if not players:
-            await interaction.response.send_message("No players in this session yet.", ephemeral=True)
-            return
+        players  = await self.db.get_session_players(session["id"], guild_id)
+        is_owner = await check_is_session_owner(interaction)
 
-        lines = [fmt_player(p, show_stats=False) for p in players]
-        embed = build_embed(
-            f"Session #{session['id']} Roster ({len(players)} players)",
-            "\n".join(lines), "blue"
+        view = SessionView(
+            session=session,
+            players=players,
+            db=self.db,
+            guild_id=guild_id,
+            invoker_id=interaction.user.id,
+            is_owner=is_owner,
         )
-        await interaction.response.send_message(embed=embed)
-
-    # ── /clear_players ────────────────────────────────────────────────────────
-
-    @app_commands.command(name="clear_players", description="Remove all players from the session roster.")
-    @is_session_owner()
-    async def clear_players(self, interaction: discord.Interaction):
-        guild_id = str(interaction.guild_id)
-        session = await self.db.get_active_session(guild_id)
-        if not session:
-            await interaction.response.send_message("No active session.", ephemeral=True)
-            return
-
-        db = self.db
-
-        class ConfirmView(discord.ui.View):
-            def __init__(self_v):
-                super().__init__(timeout=30)
-
-            @discord.ui.button(label="Yes, clear roster", style=discord.ButtonStyle.danger)
-            async def confirm(self_v, btn_inter: discord.Interaction, button: discord.ui.Button):
-                self_v.stop()
-                await db.db.execute(
-                    "DELETE FROM session_players WHERE session_id=?", (session["id"],)
-                )
-                await db.db.commit()
-                await btn_inter.response.edit_message(content="✅ Roster cleared.", view=None)
-
-            @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-            async def cancel(self_v, btn_inter: discord.Interaction, button: discord.ui.Button):
-                self_v.stop()
-                await btn_inter.response.edit_message(content="Cancelled.", view=None)
-
         await interaction.response.send_message(
-            "Remove all players from the session roster?",
-            view=ConfirmView(), ephemeral=True
+            embed=view.build_embed(), view=view, ephemeral=True
         )
-
-
-    # ── /session_settings ─────────────────────────────────────────────────────
-
-    @app_commands.command(name="session_settings", description="View or change settings for the active session.")
-    @app_commands.describe(
-        repeat_roles="Allow players to receive the same role more than once this session",
-        auto_balance="Auto-balance team splits by ELO"
-    )
-    @app_commands.choices(auto_balance=[
-        app_commands.Choice(name="Off — random teams", value="off"),
-        app_commands.Choice(name="Total ELO — balance by overall ELO", value="total"),
-        app_commands.Choice(name="Mode ELO — balance by the draft mode's ELO", value="mode"),
-    ])
-    @is_session_owner()
-    async def session_settings(self, interaction: discord.Interaction,
-                                 repeat_roles: bool = None,
-                                 auto_balance: str = None):
-        guild_id = str(interaction.guild_id)
-        session = await self.db.get_active_session(guild_id)
-        if not session:
-            await interaction.response.send_message("No active session.", ephemeral=True)
-            return
-
-        # No params → show current settings
-        if repeat_roles is None and auto_balance is None:
-            balance_labels = {"off": "❌ Off (random)", "total": "✅ Total ELO", "mode": "✅ Mode ELO"}
-            current_balance = session.get("auto_balance", "off")
-            current_repeat = bool(session.get("repeat_roles", 0))
-            embed = build_embed("Current Session Settings", color_key="blue")
-            embed.add_field(
-                name="Repeat Roles",
-                value="✅ ON — players may receive the same role multiple times"
-                      if current_repeat else
-                      "❌ OFF — players won't get the same role twice this session",
-                inline=False
-            )
-            embed.add_field(
-                name="Auto-Balance",
-                value=balance_labels.get(current_balance, current_balance),
-                inline=False
-            )
-            embed.set_footer(text=f"Session #{session['id']} · Use /session_settings with a parameter to change.")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-
-        updates = {}
-        lines = []
-        if repeat_roles is not None:
-            updates["repeat_roles"] = 1 if repeat_roles else 0
-            lines.append(f"Repeat roles: {'✅ ON' if repeat_roles else '❌ OFF'}")
-        if auto_balance is not None:
-            updates["auto_balance"] = auto_balance
-            labels = {"off": "❌ Off (random)", "total": "✅ Total ELO", "mode": "✅ Mode ELO"}
-            lines.append(f"Auto-balance: {labels.get(auto_balance, auto_balance)}")
-
-        await self.db.update_session(session["id"], **updates)
-        await interaction.response.send_message(
-            "✅ Session settings updated:\n" + "\n".join(f"• {l}" for l in lines),
-            ephemeral=True
-        )
+        view._message = await interaction.original_response()
 
 
 async def setup(bot: commands.Bot):

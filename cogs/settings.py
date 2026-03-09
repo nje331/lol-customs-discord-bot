@@ -409,54 +409,42 @@ class Settings(commands.Cog):
         is_admin_user = await check_is_admin(interaction)
         is_owner      = await check_is_session_owner(interaction)
 
-        embed = build_embed("LoL Custom Game Bot — Commands", color_key="gold")
+        embed = build_embed("LoL Custom Game Bot", color_key="gold")
 
-        embed.add_field(name="👤 Anyone", value=(
-            "`/register` — Register & set role preferences\n"
-            "`/edit_roles` — Update your role preferences\n"
-            "`/unregister` — Remove your data\n"
-            "`/stats [member]` — View win/loss stats\n"
-            "`/leaderboard` — Server win-rate leaderboard\n"
-            "`/session_players` — View current session roster\n"
-            "`/start_session [repeat_roles] [auto_balance]` — Start a session (you become owner)\n"
-            "`/lol_help` — Show this help message"
+        embed.add_field(name="👤 Everyone", value=(
+            "`/register` — set your role preferences\n"
+            "`/edit_roles` — update your role preferences\n"
+            "`/leaderboard` — win/loss standings\n"
+            "`/start_session` — open a session (you become owner)\n"
+            "`/session` — view roster and toggle settings\n"
+            "`/lol_help` — this message"
         ), inline=False)
 
         if is_owner:
             embed.add_field(name="🎮 Session Owner", value=(
-                "`/end_session` — End the current session\n"
-                "`/session_settings` — View or change repeat_roles / auto_balance mid-session\n"
-                "`/add_from_voice [channel]` — Grab players from a voice channel\n"
-                "`/add_player @p1 [@p2...]` — Add up to 5 players at once\n"
-                "`/remove_player [member]` — Remove a player from the roster\n"
-                "`/clear_players` — Clear the entire roster\n"
-                "`/make_teams [assign_roles] [ignore_prefs] [random_champs]` — Random split + optional role/champ assignment\n"
-                "`/start_draft` — Captain snake draft"
+                "`/add_from_voice` — pull players from a voice channel\n"
+                "`/add_player` — add up to 5 players by mention\n"
+                "`/remove_player` — remove a player\n"
+                "`/make_teams` — random split into two teams\n"
+                "`/start_draft` — captain snake draft\n"
+                "`/end_session` — close the session"
             ), inline=False)
 
         if is_admin_user:
-            embed.add_field(name="🔧 Admin — Server", value=(
-                "`/settings` — View and manage all server settings (channels, toggles, rerolls)\n"
-                "`/admins` — View, add, and remove bot admins\n"
-                "`/reset_stats` — Reset all players' stats, ELOs, and ELO history"
+            embed.add_field(name="🔧 Admin", value=(
+                "`/settings` — server config: channels, toggles, reroll count\n"
+                "`/admins` — manage bot admins\n"
+                "`/players` — registered players and role preferences\n"
+                "`/update_champs` — sync champion data from the current patch\n"
+                "`/view_champs` — browse and edit champion pools\n"
+                "`/clear_custom_champs` — remove all custom champions\n"
+                "`/view_elo` — ELO leaderboard\n"
+                "`/elo_history` — ELO history chart\n"
+                "`/view_ratings` — peer rating scores\n"
+                "`/reset_stats` — wipe all stats and ELO history"
             ), inline=False)
 
-            embed.add_field(name="🔧 Admin — Champions", value=(
-                "`/update_champs` — Sync champion data from CommunityDragon for the current patch\n"
-                "`/view_champs [role]` — Browse champion pools; add (modal) and remove (dropdown) custom champions\n"
-                "`/clear_custom_champs` — Remove all custom champion entries for this server"
-            ), inline=False)
-
-            embed.add_field(name="🔧 Admin — ELO & Ratings", value=(
-                "`/view_elo [type]` — View ELO leaderboard (7 modes available)\n"
-                "`/elo_history [type] [member]` — View ELO history chart\n"
-                "`/view_ratings` — View peer rating scores and engagement metrics"
-            ), inline=False)
-
-        embed.set_footer(text=(
-            "repeat_roles is OFF by default — players won't get the same role twice per session. "
-            "auto_balance can be set at session start or changed via /session_settings."
-        ))
+        embed.set_footer(text="Parameters are described when you type each command.")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 

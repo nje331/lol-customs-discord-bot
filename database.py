@@ -232,13 +232,6 @@ class Database:
         )
         await self.db.commit()
 
-    async def delete_player(self, discord_id: str, guild_id: str):
-        await self.db.execute(
-            "DELETE FROM players WHERE discord_id=? AND guild_id=?",
-            (discord_id, guild_id)
-        )
-        await self.db.commit()
-
     async def get_all_players(self, guild_id: str) -> list[dict]:
         async with self.db.execute(
             "SELECT * FROM players WHERE guild_id=? ORDER BY display_name",

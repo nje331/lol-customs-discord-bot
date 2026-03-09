@@ -81,7 +81,7 @@ Slash commands sync on startup and may take up to an hour to appear globally in 
 2. **Sync champion data** (required for random champ assignment) → `/update_champs`
    Pulls champion role stats from CommunityDragon for the current patch. Re-run after major patches.
 
-3. **Grant bot-admin access** (optional) → `/bot_admins` → ➕ Add Admin
+3. **Grant bot-admin access** (optional) → `/admins` → ➕ Add Admin
    Promote trusted non-Discord-admins to run bot commands.
 
 4. **Toggle features** (optional) → `/settings`
@@ -126,9 +126,9 @@ Session Owner or Admin:
 
 | Role | Who | Can Do |
 |------|-----|--------|
-| **Anyone** | All server members | Register, view stats, start a session |
+| **Anyone** | All server members | Register, view leaderboard, start a session |
 | **Session Owner** | Whoever ran `/start_session` | Add/remove players, make teams, end session |
-| **Bot Admin** | Set via `/add_bot_admin` | Everything a session owner can do, plus all admin commands |
+| **Bot Admin** | Set via `/admins` | Everything a session owner can do, plus all admin commands |
 | **Discord Admin** | Server Administrator / Manage Guild permission | Full access to everything |
 
 > Session owners can run all session management commands even if they are not a Discord admin or bot admin. This lets you delegate game-running to anyone without giving them server permissions.
@@ -142,47 +142,34 @@ Session Owner or Admin:
 |---------|-------------|
 | `/register` | Register and set role preferences in priority order |
 | `/edit_roles` | Update your role preferences |
-| `/unregister` | Remove yourself from the database |
-| `/stats [member]` | View win/loss stats for yourself or another player |
 | `/leaderboard` | Server win-rate leaderboard (top 15) |
-| `/session_players` | View the current session roster |
-| `/start_session [repeat_roles] [auto_balance]` | Start a new session — you become the session owner |
+| `/start_session` | Start a new session — you become the session owner |
+| `/session` | View the current roster and toggle session settings |
 | `/lol_help` | Show available commands (context-aware: shows more if you're owner/admin) |
 
-### Session Owner + Admins
+### Session Owner
 | Command | Description |
 |---------|-------------|
 | `/end_session` | End the current session |
-| `/session_settings` | View or change `repeat_roles` / `auto_balance` mid-session |
 | `/add_from_voice [channel]` | Add all members from a voice channel to the session |
 | `/add_player @p1 [@p2] [@p3] [@p4] [@p5]` | Add up to 5 players at once |
 | `/remove_player [member]` | Remove a player from the session |
-| `/clear_players` | Clear the entire session roster |
 | `/make_teams [assign_roles] [ignore_prefs] [random_champs]` | Random team split with optional role/champion assignment |
 | `/start_draft` | Captain snake draft (manual or auto captain selection) |
 
-### Admins — Server
+### Admins
 | Command | Description |
 |---------|-------------|
-| `/settings` | View and manage all server settings — channels, feature toggles, and reroll count all accessible via buttons |
-| `/bot_admins` | View all current admins (Discord + bot-granted), add members via dropdown, remove bot admins via dropdown |
-| `/reset_stats` | Reset all players' stats, ELOs (to 1500), and ELO history |
-
-### Admins — Champions
-| Command | Description |
-|---------|-------------|
+| `/settings` | Server config: channels, feature toggles, and reroll count — all via buttons |
+| `/admins` | View, add, and remove bot admins |
+| `/players` | List all registered players and their role preferences |
 | `/update_champs` | Sync champion role stats from CommunityDragon for the current patch |
-| `/view_champs [role]` | Paginated role browser showing synced + custom champions; includes inline Add/Remove buttons |
-| `/add_custom_champ [name] [role]` | Add a custom champion to a role pool (persists across patch syncs) |
-| `/remove_custom_champ [name] [role]` | Remove a custom champion from a role pool |
+| `/view_champs [role]` | Paginated role browser; add (modal) and remove (dropdown) custom champions |
 | `/clear_custom_champs` | Remove all custom champion entries for this server |
-
-### Admins — ELO & Ratings
-| Command | Description |
-|---------|-------------|
 | `/view_elo [type]` | View ELO leaderboard for any of the 7 tracked modes |
-| `/elo_history [type] [member]` | View an ELO history chart (all players for a mode, or all modes for one player) |
+| `/elo_history [type] [member]` | View an ELO history chart |
 | `/view_ratings` | View peer rating averages and engagement metrics for all players |
+| `/reset_stats` | Reset all players' stats, ELOs (to 1500), and ELO history |
 
 ---
 
@@ -201,7 +188,7 @@ When a session starts, a persistent control panel is posted with quick-action bu
 Players select up to 5 roles in priority order (Top → Jungle → Mid → ADC → Support) via an interactive dropdown during `/register` or `/edit_roles`. The bot honors preferences when assigning roles with `/make_teams`. Players with no preference are assigned whatever is left.
 
 ### Session Role Tracking
-Enabled **by default** when starting a session (`repeat_roles: False`). The bot remembers which roles each player has been assigned this session and avoids repeats. Once a player has played all 5 roles, their history resets. Toggle mid-session with `/session_settings`.
+Enabled **by default** when starting a session (`repeat_roles: False`). The bot remembers which roles each player has been assigned this session and avoids repeats. Once a player has played all 5 roles, their history resets. Toggle mid-session via `/session`.
 
 ### Team Formation — Random (`/make_teams`)
 Randomly splits the roster into two teams. Options:
@@ -231,8 +218,8 @@ After teams are formed (via random or draft), the bot posts a **Teams Ready** pr
 ### Random Champions
 When `random_champs:True` is passed to `/make_teams`, each player is assigned a random champion for their role. Requires running `/update_champs` first to populate champion data.
 
-- **Champion Weight** (toggleable via `/toggle_setting`) — when on, picks are weighted by play rate so meta champions appear more often
-- **Champ Rerolls** — set a per-player reroll budget with `/set_champ_rerolls`; players can spend rerolls to get a new champion during the game
+- **Champion Weight** (toggleable via `/settings`) — when on, picks are weighted by play rate so meta champions appear more often
+- **Champ Rerolls** — set a per-player reroll budget via `/settings`; players can spend rerolls to get a new champion during the game
 
 ### Custom Champions
 Bot admins can maintain a per-server list of custom champion entries that supplement the CommunityDragon patch data and persist across `/update_champs` syncs:
@@ -270,7 +257,7 @@ ELO is tracked automatically after every game across **7 separate modes**:
 View leaderboards with `/view_elo [type]` and history charts with `/elo_history`.
 
 ### Auto-Balance (ELO-based)
-Set at session start via `/start_session [auto_balance]` or changed mid-session via `/session_settings`. Options:
+Set at session start via `/start_session` or toggled mid-session via `/session`. Options:
 - **Off** — fully random team splits (default)
 - **Total ELO** — balances teams using each player's overall ELO
 - **Mode ELO** — balances using the ELO specific to the draft mode being played
@@ -285,8 +272,8 @@ When enabled via `/settings` (Peer Ratings toggle), players receive a DM after e
 - **Peer Ratings** toggle — enables/disables post-game rating DMs
 - **Rerolls** button — opens a modal to set the per-player reroll budget (0 = disabled)
 
-### Bot Admins (`/bot_admins`)
-`/bot_admins` opens an interactive panel showing:
+### Bot Admins (`/admins`)
+`/admins` opens an interactive panel showing:
 - **Discord Admins** — members with Administrator or Manage Guild permission (always have full access, can't be removed via bot)
 - **Bot Admins** — members explicitly granted access via the bot
 
@@ -313,7 +300,7 @@ lol-bot/
 ├── .env.example        # Template
 ├── data/               # Created automatically — holds lol_bot.db (gitignored)
 └── cogs/
-    ├── players.py      # Registration, stats, leaderboard, /bot_admins panel
+    ├── players.py      # Registration, stats, leaderboard, /admins panel
     ├── session.py      # Session lifecycle, player roster management
     ├── teams.py        # Team formation, draft, VC moves, game results, ELO updates
     ├── champions.py    # Champion sync, custom champion management, /view_champs browser
@@ -351,7 +338,7 @@ lol-bot/
 Slash commands can take up to an hour to propagate globally. They should appear within ~1 minute in the server where the bot is present after startup.
 
 **Bot not moving players to voice channels**
-Ensure the bot role has **Move Members** permission. Also check that `/configure_channels` has been run and the correct channels are set (`/settings` to verify).
+Ensure the bot role has **Move Members** permission. Also check that channels have been configured via `/settings` → Configure Channels and the correct channels are set.
 
 **Random champs not working**
 Run `/update_champs` first to populate the champion database. If a role has no champions in the pool (no synced data and no custom entries), champ assignment will be skipped for that player.

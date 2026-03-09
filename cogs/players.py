@@ -386,67 +386,6 @@ class Players(commands.Cog):
             return
         await self._run_register_flow(interaction)
 
-    # ── /unregister ──────────────────────────────────────────────────────────
-
-    @app_commands.command(name="unregister", description="Remove yourself from the bot database.")
-    async def unregister(self, interaction: discord.Interaction):
-        player = await self.db.get_player(str(interaction.user.id), str(interaction.guild_id))
-        if not player:
-            await interaction.response.send_message("You're not registered.", ephemeral=True)
-            return
-
-        db = self.db
-
-        class ConfirmView(discord.ui.View):
-            def __init__(self):
-                super().__init__(timeout=30)
-
-            @discord.ui.button(label="Yes, remove me", style=discord.ButtonStyle.danger)
-            async def confirm(self, btn_inter: discord.Interaction, button: discord.ui.Button):
-                self.stop()
-                await db.delete_player(str(btn_inter.user.id), str(btn_inter.guild_id))
-                await btn_inter.response.edit_message(
-                    content="You have been removed from the database.", view=None
-                )
-
-            @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-            async def cancel(self, btn_inter: discord.Interaction, button: discord.ui.Button):
-                self.stop()
-                await btn_inter.response.edit_message(content="Cancelled.", view=None)
-
-        await interaction.response.send_message(
-            "Are you sure? This will delete your stats and preferences.",
-            view=ConfirmView(), ephemeral=True
-        )
-
-    # ── /stats ───────────────────────────────────────────────────────────────
-
-    @app_commands.command(name="stats", description="View your stats (or another player's).")
-    @app_commands.describe(member="The player to look up (leave blank for yourself)")
-    async def stats(self, interaction: discord.Interaction, member: discord.Member = None):
-        target = member or interaction.user
-        player = await self.db.get_player(str(target.id), str(interaction.guild_id))
-        if not player:
-            await interaction.response.send_message(
-                f"{'They are' if member else 'You are'} not registered.", ephemeral=True
-            )
-            return
-
-        gp = player["games_played"]
-        gw = player["games_won"]
-        gl = player["games_lost"]
-        wr = round(gw / gp * 100, 1) if gp > 0 else 0
-        roles = " > ".join(f"{ROLE_EMOJIS.get(r, r)} {r}" for r in player["role_prefs"]) or "No preference"
-
-        embed = build_embed(f"Stats — {player['display_name']}", color_key="gold")
-        embed.add_field(name="Games Played", value=str(gp), inline=True)
-        embed.add_field(name="Wins", value=str(gw), inline=True)
-        embed.add_field(name="Losses", value=str(gl), inline=True)
-        embed.add_field(name="Win Rate", value=f"{wr}%", inline=True)
-        embed.add_field(name="Role Preferences", value=roles, inline=False)
-        embed.set_thumbnail(url=target.display_avatar.url)
-        await interaction.response.send_message(embed=embed)
-
     # ── /leaderboard ─────────────────────────────────────────────────────────
 
     @app_commands.command(name="leaderboard", description="Show server win-rate leaderboard.")
@@ -466,6 +405,29 @@ class Players(commands.Cog):
             )
 
         embed = build_embed("Leaderboard", "\n".join(lines), "gold")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ── Admin: /players ───────────────────────────────────────────────────────
+
+    @app_commands.command(name="players", description="[Admin] List all registered players and their role preferences.")
+    @is_admin()
+    async def players_cmd(self, interaction: discord.Interaction):
+        guild_id = str(interaction.guild_id)
+        all_players = await self.db.get_all_players(guild_id)
+        if not all_players:
+            await interaction.response.send_message("No players registered yet.", ephemeral=True)
+            return
+
+        lines = []
+        for p in all_players:
+            roles = " > ".join(f"{ROLE_EMOJIS.get(r, r)} {r}" for r in p["role_prefs"]) or "_none_"
+            lines.append(f"**{p['display_name']}** — {roles}")
+
+        embed = build_embed(
+            f"Registered Players ({len(all_players)})",
+            "\n".join(lines),
+            color_key="blue",
+        )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ── Admin: /admins ───────────────────────────────────────────────────────
