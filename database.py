@@ -103,6 +103,17 @@ class Database:
                 PRIMARY KEY (champ_id, role)
             );
 
+            -- Custom champions added manually by bot admins; persist across patch syncs
+            CREATE TABLE IF NOT EXISTS custom_champions (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id   TEXT NOT NULL,
+                name       TEXT NOT NULL,
+                role       TEXT NOT NULL,
+                added_by   TEXT NOT NULL,
+                added_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (guild_id, name, role)
+            );
+
             CREATE TABLE IF NOT EXISTS game_champ_rerolls (
                 game_id      INTEGER NOT NULL,
                 discord_id   TEXT NOT NULL,
@@ -443,9 +454,70 @@ class Database:
     # ── Champions ────────────────────────────────────────────────────────────
 
     async def clear_champions(self):
-        """Delete all champion entries — called before a fresh patch sync."""
+        """Delete all patch-synced champion entries — preserves custom_champions."""
         await self.db.execute("DELETE FROM champions")
         await self.db.commit()
+
+    # ── Custom Champions ──────────────────────────────────────────────────────
+
+    async def add_custom_champion(self, guild_id: str, name: str, role: str,
+                                   added_by: str) -> bool:
+        """Insert a custom champion. Returns True if inserted, False if duplicate."""
+        try:
+            await self.db.execute(
+                "INSERT INTO custom_champions (guild_id, name, role, added_by) VALUES (?, ?, ?, ?)",
+                (guild_id, name.strip(), role.upper(), added_by)
+            )
+            await self.db.commit()
+            return True
+        except Exception:
+            return False
+
+    async def remove_custom_champion(self, guild_id: str, name: str, role: str) -> bool:
+        """Delete a custom champion. Returns True if a row was deleted."""
+        cursor = await self.db.execute(
+            "DELETE FROM custom_champions WHERE guild_id=? AND LOWER(name)=LOWER(?) AND role=?",
+            (guild_id, name.strip(), role.upper())
+        )
+        await self.db.commit()
+        return cursor.rowcount > 0
+
+    async def get_custom_champions(self, guild_id: str,
+                                    role: str = None) -> list[dict]:
+        """Return custom champions for a guild, optionally filtered by role."""
+        if role:
+            async with self.db.execute(
+                "SELECT * FROM custom_champions WHERE guild_id=? AND role=? ORDER BY name",
+                (guild_id, role.upper())
+            ) as cursor:
+                rows = await cursor.fetchall()
+        else:
+            async with self.db.execute(
+                "SELECT * FROM custom_champions WHERE guild_id=? ORDER BY role, name",
+                (guild_id,)
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def clear_custom_champions(self, guild_id: str) -> int:
+        """Delete all custom champions for a guild. Returns count removed."""
+        cursor = await self.db.execute(
+            "DELETE FROM custom_champions WHERE guild_id=?", (guild_id,)
+        )
+        await self.db.commit()
+        return cursor.rowcount
+
+    async def get_all_champions_for_role(self, guild_id: str, role: str) -> dict:
+        """Return both patch-synced and custom champions for a role.
+        Returns {'synced': [...], 'custom': [...]}"""
+        role_upper = role.upper()
+        async with self.db.execute(
+            "SELECT * FROM champions WHERE role=? ORDER BY play_rate DESC",
+            (role_upper,)
+        ) as cursor:
+            synced = [dict(r) for r in await cursor.fetchall()]
+        custom = await self.get_custom_champions(guild_id, role_upper)
+        return {"synced": synced, "custom": custom}
 
     async def upsert_champion(self, champ_id: str, name: str, role: str,
                                play_rate: float, patch: str):

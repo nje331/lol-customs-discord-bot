@@ -270,42 +270,56 @@ class Settings(commands.Cog):
             "`/edit_roles` — Update your role preferences\n"
             "`/unregister` — Remove your data\n"
             "`/stats [member]` — View win/loss stats\n"
-            "`/leaderboard` — Server leaderboard\n"
-            "`/session_players` — View current roster\n"
-            "`/start_session` — Start a session (you become owner)"
+            "`/leaderboard` — Server win-rate leaderboard\n"
+            "`/session_players` — View current session roster\n"
+            "`/start_session [repeat_roles] [auto_balance]` — Start a session (you become owner)\n"
+            "`/lol_help` — Show this help message"
         ), inline=False)
 
         if is_owner:
             embed.add_field(name="🎮 Session Owner", value=(
                 "`/end_session` — End the current session\n"
                 "`/session_settings` — View or change repeat_roles / auto_balance mid-session\n"
-                "`/add_from_voice [channel]` — Grab players from a VC\n"
+                "`/add_from_voice [channel]` — Grab players from a voice channel\n"
                 "`/add_player @p1 [@p2...]` — Add up to 5 players at once\n"
-                "`/remove_player [member]` — Remove a player\n"
-                "`/clear_players` — Clear the roster\n"
-                "`/make_teams` — Random split + optional role assignment\n"
+                "`/remove_player [member]` — Remove a player from the roster\n"
+                "`/clear_players` — Clear the entire roster\n"
+                "`/make_teams [assign_roles] [random_roles] [random_champs]` — Random split + optional role/champ assignment\n"
                 "`/start_draft` — Captain snake draft"
             ), inline=False)
 
         if is_admin_user:
-            embed.add_field(name="🔧 Admin", value=(
+            embed.add_field(name="🔧 Admin — Server", value=(
                 "`/settings` — View server settings\n"
                 "`/configure_channels` — Set Team 1/2/Lobby VCs and Mod Log channel\n"
-                "`/toggle_setting` — Toggle features (Champ Weight, Peer Ratings)\n"
-                "`/set_champ_rerolls [count]` — Rerolls per player per game\n"
-                "`/view_ratings` — View peer rating scores and engagement\n"
-                "`/view_elo [type]` — View ELO leaderboard\n"
-                "`/elo_history [type] [member]` — ELO history chart\n"
-                "`/reset_stats` — Reset all players' stats, ELOs, and ELO history\n"
+                "`/toggle_setting` — Toggle Champion Weight or Peer Ratings on/off\n"
+                "`/set_champ_rerolls [count]` — Rerolls per player per game (0 = disabled)\n"
                 "`/admin_register [member]` — Manually register a player\n"
+                "`/set_weight [member] [1-10]` — Set a player's power ranking weight\n"
+                "`/view_weights` — View all player power weights\n"
                 "`/add_bot_admin [member]` — Grant bot admin to a user\n"
                 "`/remove_bot_admin [member]` — Revoke bot admin\n"
-                "`/list_bot_admins` — List all bot admins"
+                "`/list_bot_admins` — List all bot admins\n"
+                "`/reset_stats` — Reset all players' stats, ELOs, and ELO history"
+            ), inline=False)
+
+            embed.add_field(name="🔧 Admin — Champions", value=(
+                "`/update_champs` — Sync champion data from CommunityDragon for the current patch\n"
+                "`/view_champs [role]` — Browse champion pools by role; add/remove custom champions inline\n"
+                "`/add_custom_champ [name] [role]` — Add a custom champion to a role pool\n"
+                "`/remove_custom_champ [name] [role]` — Remove a custom champion\n"
+                "`/clear_custom_champs` — Remove all custom champion entries for this server"
+            ), inline=False)
+
+            embed.add_field(name="🔧 Admin — ELO & Ratings", value=(
+                "`/view_elo [type]` — View ELO leaderboard (7 modes available)\n"
+                "`/elo_history [type] [member]` — View ELO history chart\n"
+                "`/view_ratings` — View peer rating scores and engagement metrics"
             ), inline=False)
 
         embed.set_footer(text=(
-            "Roles are always tracked — use /session_settings to allow repeat_roles. "
-            "Set auto_balance when starting a session or via /session_settings."
+            "repeat_roles is OFF by default — players won't receive the same role twice per session. "
+            "auto_balance can be set at session start or changed via /session_settings."
         ))
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
