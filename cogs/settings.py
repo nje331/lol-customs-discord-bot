@@ -437,7 +437,7 @@ class Settings(commands.Cog):
         if is_admin_user:
             embed.add_field(name="🔧 Admin — Server", value=(
                 "`/settings` — View and manage all server settings (channels, toggles, rerolls)\n"
-                "`/bot_admins` — View, add, and remove bot admins\n"
+                "`/admins` — View, add, and remove bot admins\n"
                 "`/reset_stats` — Reset all players' stats, ELOs, and ELO history"
             ), inline=False)
 

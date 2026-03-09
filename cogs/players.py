@@ -124,9 +124,9 @@ class RoleSelectView(discord.ui.View):
 
 # ── Bot Admins view ───────────────────────────────────────────────────────────
 
-class BotAdminsView(discord.ui.View):
+class AdminsView(discord.ui.View):
     """
-    Shown by /bot_admins.
+    Shown by /admins.
     Lists: explicitly-added bot admins + members who pass the Discord admin check.
     Row 0: [➕ Add Admin] [➖ Remove Admin]
     Add  → dropdown of server members who are NOT already bot admins or Discord admins.
@@ -468,18 +468,18 @@ class Players(commands.Cog):
         embed = build_embed("Leaderboard", "\n".join(lines), "gold")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ── Admin: /bot_admins ────────────────────────────────────────────────────
+    # ── Admin: /admins ───────────────────────────────────────────────────────
 
     @app_commands.command(
-        name="bot_admins",
+        name="admins",
         description="[Admin] View, add, and remove bot admins for this server.",
     )
     @is_admin()
-    async def bot_admins(self, interaction: discord.Interaction):
+    async def admins(self, interaction: discord.Interaction):
         guild_id      = str(interaction.guild_id)
         bot_admin_ids = await self.db.get_bot_admins(guild_id)
 
-        view = BotAdminsView(
+        view = AdminsView(
             db=self.db,
             guild=interaction.guild,
             guild_id=guild_id,
