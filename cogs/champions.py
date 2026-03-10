@@ -5,7 +5,8 @@ Run /update_champs once to populate the DB; data is used by /make_teams random_c
 
 Custom champion commands (bot-admin only):
   
-  /champs              — paginated role browser; Add, Remove, Clear custom buttons; Add (modal) and Remove (dropdown) inline
+  /champions           — paginated role browser; Add, Remove, Clear custom buttons; Add (modal) and Remove (dropdown) inline
+                         Use role="All" to export a full champion/role CSV.
 """
 
 import discord
@@ -461,23 +462,27 @@ class Champions(commands.Cog):
             ephemeral=True,
         )
 
-    # ── /champs ───────────────────────────────────────────────────────────────
+    # ── /champions ────────────────────────────────────────────────────────────
 
     @app_commands.command(
-        name="champs",
+        name="champions",
         description="[Admin] Browse champion pools by role, with Add / Remove / Clear custom buttons."
     )
-    @app_commands.describe(role="Jump directly to a role (default: Top)")
+    @app_commands.describe(role="Jump directly to a role (default: Top), or 'All' to export a full CSV")
     @app_commands.choices(role=[
         app_commands.Choice(name=label, value=db_key)
         for label, db_key in ROLE_CHOICES.items()
-    ])
+    ] + [app_commands.Choice(name="All (export CSV)", value="ALL")])
     @is_admin()
-    async def champs(
+    async def champions(
         self,
         interaction: discord.Interaction,
         role: str = "TOP",
     ):
+        if role == "ALL":
+            await self._send_all_champions_csv(interaction)
+            return
+
         start_role = role if role in ROLE_ORDER else "TOP"
         view = ChampBrowserView(
             db=self.db,
@@ -494,6 +499,77 @@ class Champions(commands.Cog):
             ephemeral=True,
         )
         view._message = await interaction.original_response()
+
+    async def _send_all_champions_csv(self, interaction: discord.Interaction):
+        """
+        Build and send a CSV of all champions (synced + custom) with one row per champion name.
+        Columns: Name, Top, Jungle, Mid, Bot, Support, Custom_Top, Custom_Jungle,
+                 Custom_Mid, Custom_Bot, Custom_Support
+        An 'X' marks each role the champion appears under; synced and custom are tracked
+        in separate column sets so the distinction is clear.
+        """
+        await interaction.response.defer(ephemeral=True)
+        guild_id = str(interaction.guild_id)
+
+        # Gather synced champions across all roles
+        synced_map: dict[str, set[str]] = {}   # name -> set of roles (synced)
+        custom_map: dict[str, set[str]] = {}   # name -> set of roles (custom)
+
+        for role in ROLE_ORDER:
+            data = await self.db.get_all_champions_for_role(guild_id, role)
+            for c in data["synced"]:
+                synced_map.setdefault(c["name"], set()).add(role)
+            for c in data["custom"]:
+                custom_map.setdefault(c["name"], set()).add(role)
+
+        # Merge all names and sort alphabetically
+        all_names = sorted(
+            synced_map.keys() | custom_map.keys(),
+            key=str.casefold,
+        )
+
+        if not all_names:
+            await interaction.followup.send(
+                "No champion data found. Run `/update_champs` first.", ephemeral=True
+            )
+            return
+
+        # Column headers
+        synced_headers = ["Top (Synced)", "Jungle (Synced)", "Mid (Synced)",
+                          "Bot (Synced)", "Support (Synced)"]
+        custom_headers = ["Top (Custom)", "Jungle (Custom)", "Mid (Custom)",
+                          "Bot (Custom)", "Support (Custom)"]
+        role_col_keys  = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "SUPPORT"]
+
+        import io, csv
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["Champion"] + synced_headers + custom_headers)
+
+        for name in all_names:
+            synced_roles = synced_map.get(name, set())
+            custom_roles = custom_map.get(name, set())
+            row = [name]
+            for role_key in role_col_keys:
+                row.append("X" if role_key in synced_roles else "")
+            for role_key in role_col_keys:
+                row.append("X" if role_key in custom_roles else "")
+            writer.writerow(row)
+
+        csv_bytes = buf.getvalue().encode("utf-8")
+        file = discord.File(io.BytesIO(csv_bytes), filename="champions_all.csv")
+
+        synced_count = len(synced_map)
+        custom_count = len(custom_map)
+        total_unique = len(all_names)
+
+        await interaction.followup.send(
+            f"📋 **Full champion pool export** — {total_unique} unique champions "
+            f"({synced_count} synced, {custom_count} custom).\n"
+            f"Columns: synced roles then custom roles. An **X** marks each role the champion appears under.",
+            file=file,
+            ephemeral=True,
+        )
 
     # ── patch sync internals ──────────────────────────────────────────────────
 

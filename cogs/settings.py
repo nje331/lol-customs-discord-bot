@@ -436,7 +436,7 @@ class Settings(commands.Cog):
                 "`/admins` — manage bot admins\n"
                 "`/players` — registered players and role preferences\n"
                 "`/update_champs` — sync champion data from the current patch\n"
-                "`/champs [role]` — browse and edit champion pools\n"
+                "`/champions [role]` — browse and edit champion pools; use 'All' to export CSV\n"
                 "`/view_elo [type]` — ELO leaderboard\n"
                 "`/elo_history [type] [member]` — ELO history chart\n"
                 "`/view_ratings` — peer rating scores and engagement\n"
